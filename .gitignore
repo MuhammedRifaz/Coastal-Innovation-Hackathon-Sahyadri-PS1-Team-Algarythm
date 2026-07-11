@@ -7,7 +7,6 @@ backend/.pytest_cache/
 frontend/node_modules/
 frontend/dist/
 
-data/*.graphml
-!data/.gitkeep
+backend/cache/
 
 .claude/
