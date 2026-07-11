@@ -306,5 +306,18 @@ export function MapView() {
     source?.setData(fc);
   });
 
-  return <div ref={containerRef} className="absolute inset-0" />;
+  // Inline style, not Tailwind's `absolute inset-0` classes: maplibre-gl
+  // adds its own "maplibregl-map" class to this exact element, and
+  // maplibre-gl.css sets `.maplibregl-map { position: relative }` on it —
+  // same specificity as Tailwind's `.absolute` utility, so whichever
+  // stylesheet loads later in the cascade wins. When maplibre's CSS won,
+  // `position` silently flipped to relative, `inset-0` became a no-op,
+  // and the container (whose only child is an absolutely-positioned
+  // canvas that doesn't contribute to parent height) collapsed to 0px
+  // tall — the map was rendering into a real, correctly-loaded style,
+  // just inside an invisible zero-height box. Inline styles always win
+  // regardless of import order, so this can't happen again.
+  return (
+    <div ref={containerRef} style={{ position: "absolute", inset: 0 }} />
+  );
 }
