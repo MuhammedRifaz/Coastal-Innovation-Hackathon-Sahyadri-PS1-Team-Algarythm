@@ -5,4 +5,12 @@ import tailwindcss from '@tailwindcss/vite'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  server: {
+    // Proxy to the FastAPI backend (uvicorn on :8000) so the frontend can
+    // call relative /api and /ws paths in dev without hitting CORS.
+    proxy: {
+      '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/ws': { target: 'ws://127.0.0.1:8000', ws: true },
+    },
+  },
 })

@@ -1,9 +1,23 @@
+import { useEffect } from "react";
+import { MapView } from "./map/MapView";
+import { getGraph } from "./lib/api";
+import { connectWebSocket } from "./lib/ws";
+import { useAppStore } from "./store/useAppStore";
+
 function App() {
+  useEffect(() => {
+    getGraph()
+      .then((data) => useAppStore.getState().setFromGraphResponse(data))
+      .catch((err) => console.error("initial /api/graph fetch failed", err));
+
+    connectWebSocket();
+  }, []);
+
   return (
-    <div className="flex min-h-dvh items-center justify-center bg-zinc-950 text-zinc-100">
-      <p className="font-mono text-sm">ResQOS — scaffold placeholder. No UI implemented yet.</p>
+    <div className="relative h-dvh w-dvw overflow-hidden bg-eoc-bg text-eoc-text">
+      <MapView />
     </div>
-  )
+  );
 }
 
-export default App
+export default App;
