@@ -30,3 +30,14 @@ export function postFloodClear(edgeId: string): Promise<{ snapshot_seq: number }
     body: JSON.stringify({ edge_id: edgeId }),
   });
 }
+
+export function postIncident(
+  lat: number,
+  lng: number,
+  severity: number,
+): Promise<{ snapshot_seq: number; incident_id: string; mission_id: string | null }> {
+  return request("/api/incidents", {
+    method: "POST",
+    body: JSON.stringify({ lat, lng, severity }),
+  });
+}

@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 EdgeStatus = Literal["safe", "risky", "blocked"]
 POIKind = Literal["hospital", "shelter"]
@@ -69,6 +69,8 @@ class Vehicle(BaseModel):
     callsign: str
     kind: VehicleKind
     node_id: str
+    lat: float
+    lng: float
     status: VehicleStatus = "available"
     mission_id: str | None = None
 
@@ -76,7 +78,9 @@ class Vehicle(BaseModel):
 class Incident(BaseModel):
     id: str
     node_id: str
-    severity: int
+    lat: float
+    lng: float
+    severity: int = Field(ge=1, le=3)
     status: IncidentStatus = "open"
     created_at: datetime
 

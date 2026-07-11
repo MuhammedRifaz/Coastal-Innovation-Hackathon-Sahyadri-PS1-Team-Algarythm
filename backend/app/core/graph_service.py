@@ -20,7 +20,13 @@ from typing import Any, Callable
 import networkx as nx
 import osmnx as ox
 
-from app.models import POI, StateSnapshot, Zone
+from app.core import fleet
+from app.core.routing import compute_route
+from app.models import POI, Incident, Mission, StateSnapshot, Vehicle, Zone
+
+# ETA degradation beyond which a flood forces a mission reroute, even if
+# the new route is still technically reachable.
+REROUTE_ETA_WORSENING_THRESHOLD = 1.2
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GRAPH_PATH = REPO_ROOT / "data" / "demo_graph.graphml"
@@ -247,9 +253,15 @@ class GraphService:
         self.graph: nx.MultiDiGraph | None = None
         self.zones: list[Zone] = []
         self.pois: list[POI] = []
+        self.vehicles: list[Vehicle] = []
+        self.incidents: list[Incident] = []
+        self.missions: list[Mission] = []
         self.event_bus = EventBus()
         self._edge_index: dict[str, tuple[Any, Any, Any]] = {}
+        self._node_coords: dict[Any, tuple[float, float]] = {}
         self._seq = 0
+        self._incident_seq = 0
+        self._mission_seq = 0
 
     def load(
         self,
@@ -259,6 +271,10 @@ class GraphService:
         self.graph = load_graph(graph_path)
         self.zones, self.pois = load_annotations(self.graph, demo_area_path)
         self._edge_index = _index_edges(self.graph)
+        self._node_coords = {
+            node: (data["x"], data["y"]) for node, data in self.graph.nodes(data=True)
+        }
+        self.vehicles = fleet.seed_vehicles(self.zones, self._node_coords)
 
     def to_geojson(self) -> dict[str, Any]:
         assert self.graph is not None, "GraphService.load() must run before use"
@@ -284,9 +300,9 @@ class GraphService:
             ts=datetime.now(timezone.utc),
             computed_in_ms=computed_in_ms,
             edges_geojson=edges_geojson,
-            vehicles=[],
-            incidents=[],
-            missions=[],
+            vehicles=self.vehicles,
+            incidents=self.incidents,
+            missions=self.missions,
             pois=self.pois,
             zones=self.zones,
             latest_impact=None,
@@ -295,12 +311,14 @@ class GraphService:
         )
 
     def apply_flood(self, edge_id: str, depth_cm: float) -> StateSnapshot:
-        """Mutate the edge in place, build one snapshot for the whole update
-        cycle, and emit it on graph_changed so subscribers (the WS
-        broadcaster) can push the exact same snapshot to clients."""
+        """Mutate the edge in place, reassess active missions against the
+        new graph, build one snapshot for the whole update cycle, and emit
+        it on graph_changed so subscribers (the WS broadcaster) can push
+        the exact same snapshot to clients."""
         start = time.perf_counter()
         u, v, k = self._lookup_edge(edge_id)
         _set_edge_flood(self.graph, u, v, k, depth_cm)
+        self._reassess_missions()
         snapshot = self.build_snapshot(started_at=start)
         self.event_bus.emit("graph_changed", snapshot)
         return snapshot
@@ -309,6 +327,83 @@ class GraphService:
         start = time.perf_counter()
         u, v, k = self._lookup_edge(edge_id)
         _set_edge_flood(self.graph, u, v, k, 0.0)
+        self._reassess_missions()
         snapshot = self.build_snapshot(started_at=start)
         self.event_bus.emit("graph_changed", snapshot)
         return snapshot
+
+    def snap_to_node(self, lat: float, lng: float) -> Any:
+        node = ox.distance.nearest_nodes(self.graph, X=lng, Y=lat)
+        return node
+
+    def create_incident(self, lat: float, lng: float, severity: int) -> StateSnapshot:
+        """Snap to nearest node, create the Incident, assign the nearest
+        available vehicle by straight-line distance (temporary until
+        Prompt 8's true route-cost assignment), compute its route, and
+        create the Mission — all in one update cycle."""
+        start = time.perf_counter()
+
+        node_id = self.snap_to_node(lat, lng)
+        # Use the snapped node's own coordinates (not the raw click point)
+        # so the marker lines up exactly with the mission route's endpoint.
+        node_lng, node_lat = self._node_coords[node_id]
+        self._incident_seq += 1
+        incident = Incident(
+            id=f"incident-{self._incident_seq}",
+            node_id=str(node_id),
+            lat=node_lat,
+            lng=node_lng,
+            severity=severity,
+            status="open",
+            created_at=datetime.now(timezone.utc),
+        )
+        self.incidents.append(incident)
+
+        vehicle = fleet.assign_nearest(self.vehicles, (lng, lat), self._node_coords)
+        if vehicle is not None:
+            route = compute_route(self.graph, int(vehicle.node_id), node_id)
+            self._mission_seq += 1
+            mission = Mission(
+                id=f"mission-{self._mission_seq}",
+                incident_id=incident.id,
+                vehicle_id=vehicle.id,
+                route=route,
+                eta_s=route.eta_s,
+                status="active",
+            )
+            self.missions.append(mission)
+            vehicle.status = "en_route"
+            vehicle.mission_id = mission.id
+            incident.status = "assigned"
+
+        snapshot = self.build_snapshot(started_at=start)
+        self.event_bus.emit("graph_changed", snapshot)
+        return snapshot
+
+    def _vehicle_by_id(self, vehicle_id: str) -> Vehicle | None:
+        return next((v for v in self.vehicles if v.id == vehicle_id), None)
+
+    def _incident_by_id(self, incident_id: str) -> Incident | None:
+        return next((i for i in self.incidents if i.id == incident_id), None)
+
+    def _reassess_missions(self) -> None:
+        """Recompute the route for every active/rerouted mission. If it
+        becomes unreachable or its ETA worsens by more than the threshold,
+        update the mission's route and mark it rerouted."""
+        for mission in self.missions:
+            if mission.status not in ("active", "rerouted"):
+                continue
+            vehicle = self._vehicle_by_id(mission.vehicle_id)
+            incident = self._incident_by_id(mission.incident_id)
+            if vehicle is None or incident is None:
+                continue
+
+            new_route = compute_route(self.graph, int(vehicle.node_id), int(incident.node_id))
+            old_eta = mission.eta_s
+            worsened = not new_route.reachable or (
+                old_eta > 0 and new_route.eta_s > old_eta * REROUTE_ETA_WORSENING_THRESHOLD
+            )
+            if worsened:
+                mission.route = new_route
+                mission.eta_s = new_route.eta_s
+                mission.status = "rerouted"

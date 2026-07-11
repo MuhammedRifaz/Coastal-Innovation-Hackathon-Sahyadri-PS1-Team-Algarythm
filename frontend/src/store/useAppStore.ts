@@ -4,12 +4,15 @@
 // added by later prompts).
 import { create } from "zustand";
 import type { FeatureCollection } from "geojson";
-import type { GraphResponse, POI, StateSnapshot, Zone } from "../lib/types";
+import type { GraphResponse, Incident, Mission, POI, StateSnapshot, Vehicle, Zone } from "../lib/types";
 
 interface AppState {
   roads: FeatureCollection | null;
   pois: POI[];
   zones: Zone[];
+  vehicles: Vehicle[];
+  incidents: Incident[];
+  missions: Mission[];
   seq: number;
   computedInMs: number;
   wsConnected: boolean;
@@ -22,6 +25,9 @@ export const useAppStore = create<AppState>((set) => ({
   roads: null,
   pois: [],
   zones: [],
+  vehicles: [],
+  incidents: [],
+  missions: [],
   seq: 0,
   computedInMs: 0,
   wsConnected: false,
@@ -34,6 +40,9 @@ export const useAppStore = create<AppState>((set) => ({
       roads: snapshot.edges_geojson,
       pois: snapshot.pois,
       zones: snapshot.zones,
+      vehicles: snapshot.vehicles,
+      incidents: snapshot.incidents,
+      missions: snapshot.missions,
       seq: snapshot.seq,
       computedInMs: snapshot.computed_in_ms,
     }),

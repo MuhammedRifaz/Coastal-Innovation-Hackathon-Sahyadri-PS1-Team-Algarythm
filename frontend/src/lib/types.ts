@@ -52,6 +52,8 @@ export interface Vehicle {
   callsign: string;
   kind: VehicleKind;
   node_id: string;
+  lat: number;
+  lng: number;
   status: VehicleStatus;
   mission_id: string | null;
 }
@@ -59,6 +61,8 @@ export interface Vehicle {
 export interface Incident {
   id: string;
   node_id: string;
+  lat: number;
+  lng: number;
   severity: number;
   status: IncidentStatus;
   created_at: string;

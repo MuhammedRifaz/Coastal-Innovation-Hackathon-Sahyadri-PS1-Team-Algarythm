@@ -1,13 +1,13 @@
 """REST command endpoints (commands only — state flows over the WebSocket).
 
 Routes to add as later build prompts land:
-POST /api/incidents, /api/incidents/{id}/resolve
+POST /api/incidents/{id}/resolve
 POST /api/whatif
 POST /api/scenario/start, /api/scenario/reset
 """
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.graph_service import EdgeNotFoundError
 
@@ -21,6 +21,12 @@ class FloodRequest(BaseModel):
 
 class FloodClearRequest(BaseModel):
     edge_id: str
+
+
+class IncidentRequest(BaseModel):
+    lat: float
+    lng: float
+    severity: int = Field(ge=1, le=3)
 
 
 @router.get("/graph")
@@ -52,3 +58,16 @@ async def post_flood_clear(payload: FloodClearRequest, request: Request) -> dict
     except EdgeNotFoundError:
         raise HTTPException(status_code=404, detail=f"edge_id '{payload.edge_id}' not found")
     return {"snapshot_seq": snapshot.seq}
+
+
+@router.post("/incidents")
+async def post_incident(payload: IncidentRequest, request: Request) -> dict:
+    graph_service = request.app.state.graph_service
+    snapshot = graph_service.create_incident(payload.lat, payload.lng, payload.severity)
+    incident = snapshot.incidents[-1]
+    mission = next((m for m in snapshot.missions if m.incident_id == incident.id), None)
+    return {
+        "snapshot_seq": snapshot.seq,
+        "incident_id": incident.id,
+        "mission_id": mission.id if mission else None,
+    }
