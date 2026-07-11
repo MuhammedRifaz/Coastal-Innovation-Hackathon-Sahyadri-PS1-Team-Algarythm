@@ -1,18 +1,18 @@
 {
-  "_comment": "PLACEHOLDER / HAND-CURATED DEMO DATA. Coordinates are plausible points inside the fetch_graph.py bbox (NH66 Netravati river crossing, Mangaluru); populations are illustrative round numbers for the pitch demo, not measured data. Edit freely before the real demo.",
+  "_comment": "PLACEHOLDER / HAND-CURATED DEMO DATA. Coordinates are plausible points inside the fetch_graph.py bbox (NH66 Nethravathi Bridge crossing between Mangaluru and Ullal); populations are illustrative round numbers for the pitch demo, not measured data. Zone/POI placement verified programmatically: removing the bridge's 3 edge segments (see CRITICAL_BRIDGE_EDGE_IDS in graph_service.py) splits the graph into a north (Mangaluru) and south (Ullal) component with no other connecting route in this extract, and every north-* zone/POI below snaps to the north component while every south-* one snaps to the south component. Edit freely before the real demo.",
   "zones": [
     { "id": "zone-north-1", "name": "North-1 (Kotekar)", "lat": 12.852, "lng": 74.841, "population": 3200 },
     { "id": "zone-north-2", "name": "North-2 (Bengre Camp)", "lat": 12.849, "lng": 74.855, "population": 2100 },
-    { "id": "zone-north-3", "name": "North-3 (Netravati Layout)", "lat": 12.847, "lng": 74.858, "population": 1300 },
-    { "id": "zone-south-1", "name": "South-1 (Panemangalore)", "lat": 12.833, "lng": 74.845, "population": 2600 },
-    { "id": "zone-south-2", "name": "South-2 (Farangipete Junction)", "lat": 12.831, "lng": 74.852, "population": 1800 },
-    { "id": "zone-central", "name": "Central (Kudupu Cross)", "lat": 12.842, "lng": 74.838, "population": 2400 },
-    { "id": "zone-west", "name": "West (Kalladka Road)", "lat": 12.845, "lng": 74.836, "population": 1500 }
+    { "id": "zone-north-3", "name": "North-3 (Netravati Layout)", "lat": 12.846, "lng": 74.858, "population": 1300 },
+    { "id": "zone-south-1", "name": "South-1 (Panemangalore)", "lat": 12.828, "lng": 74.845, "population": 2600 },
+    { "id": "zone-south-2", "name": "South-2 (Farangipete Junction)", "lat": 12.815, "lng": 74.850, "population": 1800 },
+    { "id": "zone-central", "name": "Central (Kudupu Cross)", "lat": 12.858, "lng": 74.845, "population": 2400 },
+    { "id": "zone-west", "name": "West (Kalladka Road)", "lat": 12.860, "lng": 74.838, "population": 1500 }
   ],
   "pois": [
-    { "id": "poi-hospital-1", "kind": "hospital", "name": "City General Hospital", "lat": 12.848, "lng": 74.856, "stroke_ready": true },
-    { "id": "poi-hospital-2", "kind": "hospital", "name": "Farangipete Community Hospital", "lat": 12.832, "lng": 74.848, "stroke_ready": false },
-    { "id": "poi-shelter-1", "kind": "shelter", "name": "Kotekar Relief Shelter", "lat": 12.853, "lng": 74.840 },
-    { "id": "poi-shelter-2", "kind": "shelter", "name": "Panemangalore Assembly Point", "lat": 12.834, "lng": 74.844 }
+    { "id": "poi-hospital-1", "kind": "hospital", "name": "City General Hospital", "lat": 12.847, "lng": 74.859, "stroke_ready": true },
+    { "id": "poi-hospital-2", "kind": "hospital", "name": "Farangipete Community Hospital", "lat": 12.822, "lng": 74.848, "stroke_ready": false },
+    { "id": "poi-shelter-1", "kind": "shelter", "name": "Kotekar Relief Shelter", "lat": 12.855, "lng": 74.840 },
+    { "id": "poi-shelter-2", "kind": "shelter", "name": "Panemangalore Assembly Point", "lat": 12.830, "lng": 74.844 }
   ]
 }

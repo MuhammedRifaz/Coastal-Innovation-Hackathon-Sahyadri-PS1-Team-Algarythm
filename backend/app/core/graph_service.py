@@ -4,24 +4,23 @@ Loads the cached OSM GraphML into an in-memory NetworkX MultiDiGraph at
 FastAPI startup, enriches every edge with the routing/flood attributes the
 rest of core/ depends on, snaps POIs/zones from data/demo_area.json to
 their nearest graph nodes, and precomputes approximate betweenness
-centrality to flag critical edges.
-
-apply_flood/clear_flood and build_snapshot (full WebSocket contract) land
-in Prompt 4 — this module only covers load-time setup and the read-only
-GeoJSON view needed for GET /api/graph.
+centrality to flag critical edges. apply_flood/clear_flood mutate edge
+state in place and emit a graph_changed event; GraphService.build_snapshot
+assembles the full StateSnapshot broadcast over the WebSocket.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import networkx as nx
 import osmnx as ox
 
-from app.models import POI, Zone
+from app.models import POI, StateSnapshot, Zone
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GRAPH_PATH = REPO_ROOT / "data" / "demo_graph.graphml"
@@ -31,6 +30,19 @@ IMPASSABLE_CM = 30.0
 BETWEENNESS_SAMPLE_K = 200
 CRITICAL_FRACTION = 0.03
 DEFAULT_SPEED_KPH = 30.0
+
+# The real NH66 Nethravathi Bridge crossing in the fetch_graph.py extract is
+# represented as 3 separate directed edges (opposite-carriageway OSM ways).
+# Flooding all 3 together is what actually disconnects the north (Mangaluru)
+# and south (Ullal) sides — flooding just one still leaves the others as a
+# passable parallel connection. Documented here for the scenario/impact-
+# analyzer prompts; not used by flood/routing logic itself, which floods
+# whatever edge_id it's told to.
+CRITICAL_BRIDGE_EDGE_IDS = (
+    "3610166954_11266540718_0",
+    "11266540706_11266540687_0",
+    "11266540707_5596107411_0",
+)
 
 
 def _highway_class(value: Any) -> str:
@@ -195,6 +207,38 @@ REQUIRED_EDGE_ATTRS = (
 )
 
 
+class EdgeNotFoundError(KeyError):
+    """Raised by apply_flood/clear_flood when edge_id doesn't exist."""
+
+
+class EventBus:
+    """Tiny synchronous pub/sub. emit() calls every subscriber immediately,
+    in-process — no async, no queue, no external broker. Subscribers that
+    need to do async work (like broadcasting over a WebSocket) are
+    responsible for scheduling that themselves (e.g. asyncio.create_task)."""
+
+    def __init__(self) -> None:
+        self._subscribers: dict[str, list[Callable[[Any], None]]] = {}
+
+    def on(self, event: str, handler: Callable[[Any], None]) -> None:
+        self._subscribers.setdefault(event, []).append(handler)
+
+    def emit(self, event: str, payload: Any = None) -> None:
+        for handler in self._subscribers.get(event, []):
+            handler(payload)
+
+
+def _index_edges(graph: nx.MultiDiGraph) -> dict[str, tuple[Any, Any, Any]]:
+    return {data["edge_id"]: (u, v, k) for u, v, k, data in graph.edges(keys=True, data=True)}
+
+
+def _set_edge_flood(graph: nx.MultiDiGraph, u: Any, v: Any, k: Any, depth_cm: float) -> None:
+    data = graph[u][v][k]
+    data["flood_depth_cm"] = float(depth_cm)
+    data["status"] = _edge_status(depth_cm)
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
 class GraphService:
     """Holds the process-lifetime graph + POIs/zones. One instance lives on
     app.state, constructed and loaded during the FastAPI lifespan."""
@@ -203,6 +247,9 @@ class GraphService:
         self.graph: nx.MultiDiGraph | None = None
         self.zones: list[Zone] = []
         self.pois: list[POI] = []
+        self.event_bus = EventBus()
+        self._edge_index: dict[str, tuple[Any, Any, Any]] = {}
+        self._seq = 0
 
     def load(
         self,
@@ -211,7 +258,57 @@ class GraphService:
     ) -> None:
         self.graph = load_graph(graph_path)
         self.zones, self.pois = load_annotations(self.graph, demo_area_path)
+        self._edge_index = _index_edges(self.graph)
 
     def to_geojson(self) -> dict[str, Any]:
         assert self.graph is not None, "GraphService.load() must run before use"
         return graph_to_geojson(self.graph)
+
+    def _lookup_edge(self, edge_id: str) -> tuple[Any, Any, Any]:
+        try:
+            return self._edge_index[edge_id]
+        except KeyError:
+            raise EdgeNotFoundError(edge_id) from None
+
+    def build_snapshot(self, started_at: float | None = None) -> StateSnapshot:
+        """Assemble the full StateSnapshot. `started_at` lets a caller that
+        already mutated the graph (apply_flood/clear_flood) time the whole
+        update cycle rather than just the snapshot assembly."""
+        assert self.graph is not None, "GraphService.load() must run before use"
+        start = started_at if started_at is not None else time.perf_counter()
+        self._seq += 1
+        edges_geojson = self.to_geojson()
+        computed_in_ms = (time.perf_counter() - start) * 1000
+        return StateSnapshot(
+            seq=self._seq,
+            ts=datetime.now(timezone.utc),
+            computed_in_ms=computed_in_ms,
+            edges_geojson=edges_geojson,
+            vehicles=[],
+            incidents=[],
+            missions=[],
+            pois=self.pois,
+            zones=self.zones,
+            latest_impact=None,
+            safe_zone_map={},
+            decisions=[],
+        )
+
+    def apply_flood(self, edge_id: str, depth_cm: float) -> StateSnapshot:
+        """Mutate the edge in place, build one snapshot for the whole update
+        cycle, and emit it on graph_changed so subscribers (the WS
+        broadcaster) can push the exact same snapshot to clients."""
+        start = time.perf_counter()
+        u, v, k = self._lookup_edge(edge_id)
+        _set_edge_flood(self.graph, u, v, k, depth_cm)
+        snapshot = self.build_snapshot(started_at=start)
+        self.event_bus.emit("graph_changed", snapshot)
+        return snapshot
+
+    def clear_flood(self, edge_id: str) -> StateSnapshot:
+        start = time.perf_counter()
+        u, v, k = self._lookup_edge(edge_id)
+        _set_edge_flood(self.graph, u, v, k, 0.0)
+        snapshot = self.build_snapshot(started_at=start)
+        self.event_bus.emit("graph_changed", snapshot)
+        return snapshot
