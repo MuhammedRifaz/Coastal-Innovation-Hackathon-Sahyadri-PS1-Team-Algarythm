@@ -1,5 +1,5 @@
 // Typed fetch helpers for the REST command endpoints.
-import type { GraphResponse } from "./types";
+import type { GraphResponse, ImpactReport } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -41,3 +41,29 @@ export function postIncident(
     body: JSON.stringify({ lat, lng, severity }),
   });
 }
+
+export function postWhatIf(edgeId: string): Promise<ImpactReport> {
+  return request<ImpactReport>("/api/whatif", {
+    method: "POST",
+    body: JSON.stringify({ edge_id: edgeId }),
+  });
+}
+
+export function postResolveIncident(incidentId: string): Promise<{ snapshot_seq: number }> {
+  return request(`/api/incidents/${incidentId}/resolve`, {
+    method: "POST",
+  });
+}
+
+export function postScenarioStart(): Promise<{ status: string }> {
+  return request("/api/scenario/start", {
+    method: "POST",
+  });
+}
+
+export function postScenarioReset(): Promise<{ status: string }> {
+  return request("/api/scenario/reset", {
+    method: "POST",
+  });
+}
+

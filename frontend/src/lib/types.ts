@@ -43,6 +43,8 @@ export interface Zone {
   id: string;
   name: string;
   centroid_node_id: string;
+  lat: number;
+  lng: number;
   population: number;
   reachable_hospitals: string[];
 }
@@ -87,6 +89,7 @@ export interface Mission {
   backup_route: RouteResult | null;
   eta_s: number;
   status: MissionStatus;
+  reasons: string[];
 }
 
 export interface MissionDelta {

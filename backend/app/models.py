@@ -60,6 +60,8 @@ class Zone(BaseModel):
     id: str
     name: str
     centroid_node_id: str
+    lat: float
+    lng: float
     population: int
     reachable_hospitals: list[str] = []
 
@@ -104,6 +106,7 @@ class Mission(BaseModel):
     backup_route: RouteResult | None = None
     eta_s: float
     status: MissionStatus = "active"
+    reasons: list[str] = []
 
 
 class MissionDelta(BaseModel):

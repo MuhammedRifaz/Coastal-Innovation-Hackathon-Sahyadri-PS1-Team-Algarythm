@@ -1,0 +1,43 @@
+{
+  "name": "monsoon_surge",
+  "title": "Monsoon Surge — NH66 River Crossing Scenario",
+  "description": "Simulates a rapid monsoon event: initial flooding on urban roads, a south-side incident, then the NH66 bridge is overwhelmed — cutting off two zones and forcing a reassignment.",
+  "steps": [
+    {
+      "t_s": 0,
+      "action": "incident",
+      "params": { "lat": 12.863, "lng": 74.841, "severity": 2 },
+      "narrate": "Flooding reported near city centre — Unit 1 dispatched"
+    },
+    {
+      "t_s": 3,
+      "action": "flood",
+      "params": { "edge_id": "auto:urban-north-1", "depth_cm": 20 },
+      "narrate": "Urban road south of Bunder showing 20 cm water"
+    },
+    {
+      "t_s": 6,
+      "action": "incident",
+      "params": { "lat": 12.815, "lng": 74.850, "severity": 3 },
+      "narrate": "High-severity incident in Ullal — south of the river"
+    },
+    {
+      "t_s": 10,
+      "action": "flood_bridge",
+      "params": { "depth_cm": 55 },
+      "narrate": "NH66 bridge overwhelmed — 55 cm depth, bridge severed"
+    },
+    {
+      "t_s": 15,
+      "action": "incident",
+      "params": { "lat": 12.820, "lng": 74.843, "severity": 2 },
+      "narrate": "Additional incident south of the river"
+    },
+    {
+      "t_s": 20,
+      "action": "flood",
+      "params": { "edge_id": "auto:urban-north-2", "depth_cm": 35 },
+      "narrate": "Second northern road blocked — 35 cm"
+    }
+  ]
+}

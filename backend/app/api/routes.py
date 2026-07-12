@@ -2,7 +2,6 @@
 
 Routes to add as later build prompts land:
 POST /api/incidents/{id}/resolve
-POST /api/whatif
 POST /api/scenario/start, /api/scenario/reset
 """
 
@@ -27,6 +26,10 @@ class IncidentRequest(BaseModel):
     lat: float
     lng: float
     severity: int = Field(ge=1, le=3)
+
+
+class WhatIfRequest(BaseModel):
+    edge_id: str
 
 
 @router.get("/graph")
@@ -71,3 +74,36 @@ async def post_incident(payload: IncidentRequest, request: Request) -> dict:
         "incident_id": incident.id,
         "mission_id": mission.id if mission else None,
     }
+
+
+@router.post("/whatif")
+async def post_whatif(payload: WhatIfRequest, request: Request) -> dict:
+    """Hypothetically close a road and report the impact — mutates nothing."""
+    graph_service = request.app.state.graph_service
+    try:
+        report = graph_service.whatif(payload.edge_id)
+    except EdgeNotFoundError:
+        raise HTTPException(status_code=404, detail=f"edge_id '{payload.edge_id}' not found")
+    return report.model_dump(mode="json")
+
+
+@router.post("/incidents/{incident_id}/resolve")
+async def resolve_incident(incident_id: str, request: Request) -> dict:
+    graph_service = request.app.state.graph_service
+    snapshot = graph_service.resolve_incident(incident_id)
+    return {"snapshot_seq": snapshot.seq}
+
+
+@router.post("/scenario/start")
+async def start_scenario(request: Request) -> dict:
+    scenario_runner = request.app.state.scenario_runner
+    await scenario_runner.start()
+    return {"status": "started"}
+
+
+@router.post("/scenario/reset")
+async def reset_scenario(request: Request) -> dict:
+    scenario_runner = request.app.state.scenario_runner
+    await scenario_runner.reset()
+    return {"status": "reset"}
+

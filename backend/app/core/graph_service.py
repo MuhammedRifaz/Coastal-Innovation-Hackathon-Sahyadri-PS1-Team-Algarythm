@@ -20,13 +20,11 @@ from typing import Any, Callable
 import networkx as nx
 import osmnx as ox
 
-from app.core import fleet
-from app.core.routing import compute_route
-from app.models import POI, Incident, Mission, StateSnapshot, Vehicle, Zone
+from app.core import fleet, impact
+from app.models import POI, Decision, ImpactReport, Incident, Mission, StateSnapshot, Vehicle, Zone
 
-# ETA degradation beyond which a flood forces a mission reroute, even if
-# the new route is still technically reachable.
-REROUTE_ETA_WORSENING_THRESHOLD = 1.2
+# Maximum number of Decision entries kept in the snapshot.
+MAX_DECISIONS = 50
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GRAPH_PATH = REPO_ROOT / "data" / "demo_graph.graphml"
@@ -49,6 +47,16 @@ CRITICAL_BRIDGE_EDGE_IDS = (
     "11266540706_11266540687_0",
     "11266540707_5596107411_0",
 )
+
+# Flooding/clearing one edge in a group applies to the whole group as one
+# atomic action. Without this, a single click on the bridge would only
+# flood one of its 3 parallel carriageway segments and visibly do
+# nothing — the demo needs "click the bridge, it's out" to be one click.
+_EDGE_GROUPS: dict[str, tuple[str, ...]] = {eid: CRITICAL_BRIDGE_EDGE_IDS for eid in CRITICAL_BRIDGE_EDGE_IDS}
+
+
+def _edges_in_group(edge_id: str) -> tuple[str, ...]:
+    return _EDGE_GROUPS.get(edge_id, (edge_id,))
 
 
 def _highway_class(value: Any) -> str:
@@ -144,6 +152,12 @@ def load_annotations(
                 id=raw_zone["id"],
                 name=raw_zone["name"],
                 centroid_node_id=str(node_id),
+                # The zone's own curated lat/lng (a population center), not
+                # the snapped road node's coordinates — centroid_node_id is
+                # only a routing anchor and may sit slightly off the true
+                # zone location.
+                lat=raw_zone["lat"],
+                lng=raw_zone["lng"],
                 population=raw_zone["population"],
             )
         )
@@ -257,11 +271,15 @@ class GraphService:
         self.incidents: list[Incident] = []
         self.missions: list[Mission] = []
         self.event_bus = EventBus()
+        self.latest_impact: ImpactReport | None = None
+        self.decisions: list[Decision] = []
         self._edge_index: dict[str, tuple[Any, Any, Any]] = {}
         self._node_coords: dict[Any, tuple[float, float]] = {}
+        self._components_cache: dict[Any, int] = {}
         self._seq = 0
         self._incident_seq = 0
         self._mission_seq = 0
+        self._decision_seq = 0
 
     def load(
         self,
@@ -275,6 +293,7 @@ class GraphService:
             node: (data["x"], data["y"]) for node, data in self.graph.nodes(data=True)
         }
         self.vehicles = fleet.seed_vehicles(self.zones, self._node_coords)
+        self._components_cache = impact.compute_components(self.graph)
 
     def to_geojson(self) -> dict[str, Any]:
         assert self.graph is not None, "GraphService.load() must run before use"
@@ -285,6 +304,29 @@ class GraphService:
             return self._edge_index[edge_id]
         except KeyError:
             raise EdgeNotFoundError(edge_id) from None
+
+    def _add_decision(
+        self,
+        kind: str,
+        headline: str,
+        reasons: list[str],
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Append a Decision to the ring buffer (capped at MAX_DECISIONS)."""
+        self._decision_seq += 1
+        from app.models import DecisionKind  # local to avoid circular at module level
+        self.decisions.append(
+            Decision(
+                id=f"decision-{self._decision_seq}",
+                ts=datetime.now(timezone.utc),
+                kind=kind,  # type: ignore[arg-type]
+                headline=headline,
+                reasons=reasons,
+                data=data or {},
+            )
+        )
+        if len(self.decisions) > MAX_DECISIONS:
+            self.decisions = self.decisions[-MAX_DECISIONS:]
 
     def build_snapshot(self, started_at: float | None = None) -> StateSnapshot:
         """Assemble the full StateSnapshot. `started_at` lets a caller that
@@ -305,42 +347,108 @@ class GraphService:
             missions=self.missions,
             pois=self.pois,
             zones=self.zones,
-            latest_impact=None,
+            latest_impact=self.latest_impact,
             safe_zone_map={},
-            decisions=[],
+            decisions=list(self.decisions),
         )
 
-    def apply_flood(self, edge_id: str, depth_cm: float) -> StateSnapshot:
-        """Mutate the edge in place, reassess active missions against the
-        new graph, build one snapshot for the whole update cycle, and emit
-        it on graph_changed so subscribers (the WS broadcaster) can push
-        the exact same snapshot to clients."""
-        start = time.perf_counter()
-        u, v, k = self._lookup_edge(edge_id)
-        _set_edge_flood(self.graph, u, v, k, depth_cm)
+    def _apply_flood_and_analyze(self, edge_id: str, depth_cm: float, start: float) -> StateSnapshot:
+        group = _edges_in_group(edge_id)
+        group_locations = [self._lookup_edge(eid) for eid in group]
+        old_statuses = [self.graph[u][v][k]["status"] for u, v, k in group_locations]
+
+        for u, v, k in group_locations:
+            _set_edge_flood(self.graph, u, v, k, depth_cm)
+        new_statuses = [self.graph[u][v][k]["status"] for u, v, k in group_locations]
+
+        mission_etas_before = {m.id: m.eta_s for m in self.missions}
         self._reassess_missions()
-        snapshot = self.build_snapshot(started_at=start)
+
+        # A group only actually changes the passable subgraph when it goes
+        # from "not fully blocked" to "fully blocked" (or the reverse) —
+        # for the bridge, that's the difference between one carriageway
+        # still open and the whole crossing being severed.
+        was_severed = all(status == "blocked" for status in old_statuses)
+        is_severed = all(status == "blocked" for status in new_statuses)
+
+        if is_severed and not was_severed:
+            report = impact.analyze_impact(
+                self.graph,
+                edge_id,
+                self.zones,
+                self.pois,
+                self.missions,
+                self.vehicles,
+                self._node_coords,
+                self._components_cache,
+                mission_etas_before,
+            )
+            self._components_cache = impact.compute_components(self.graph)
+            self.latest_impact = report
+        elif was_severed and not is_severed:
+            self._components_cache = impact.compute_components(self.graph)
+            self.latest_impact = None
+
+        return self.build_snapshot(started_at=start)
+
+    def apply_flood(self, edge_id: str, depth_cm: float) -> StateSnapshot:
+        """Mutate the edge in place, reassess active missions and run
+        impact analysis against the new graph, build one snapshot for the
+        whole update cycle, and emit it on graph_changed so subscribers
+        (the WS broadcaster) can push the exact same snapshot to clients."""
+        start = time.perf_counter()
+        snapshot = self._apply_flood_and_analyze(edge_id, depth_cm, start)
         self.event_bus.emit("graph_changed", snapshot)
         return snapshot
 
     def clear_flood(self, edge_id: str) -> StateSnapshot:
         start = time.perf_counter()
-        u, v, k = self._lookup_edge(edge_id)
-        _set_edge_flood(self.graph, u, v, k, 0.0)
-        self._reassess_missions()
-        snapshot = self.build_snapshot(started_at=start)
+        snapshot = self._apply_flood_and_analyze(edge_id, 0.0, start)
         self.event_bus.emit("graph_changed", snapshot)
         return snapshot
+
+    def whatif(self, edge_id: str) -> ImpactReport:
+        """Hypothetically block edge_id's whole linked group (e.g. all 3
+        bridge carriageway segments) on a throwaway copy of the graph and
+        analyze impact — the real graph and all state are untouched."""
+        graph_copy = self.graph.copy()
+        for eid in _edges_in_group(edge_id):
+            u, v, k = self._lookup_edge(eid)
+            # graph.copy() shares edge attribute dicts with the original —
+            # a plain `graph_copy[u][v][k] = ...` can't fix that (edges[]
+            # is a read-only AtlasView), so give only the edges we're
+            # mutating their own dict by removing and re-adding them,
+            # which is what actually decouples them from the original.
+            attrs = dict(graph_copy.edges[u, v, k])
+            graph_copy.remove_edge(u, v, key=k)
+            graph_copy.add_edge(u, v, key=k, **attrs)
+            _set_edge_flood(graph_copy, u, v, k, IMPASSABLE_CM + 20.0)
+
+        # analyze_impact() updates each zone's reachable_hospitals in place
+        # (desired for the real apply_flood path) — pass copies here so a
+        # hypothetical what-if can't leak into real zone state.
+        zone_copies = [z.model_copy() for z in self.zones]
+        mission_etas_before = {m.id: m.eta_s for m in self.missions}
+        return impact.analyze_impact(
+            graph_copy,
+            edge_id,
+            zone_copies,
+            self.pois,
+            self.missions,
+            self.vehicles,
+            self._node_coords,
+            self._components_cache,
+            mission_etas_before,
+        )
 
     def snap_to_node(self, lat: float, lng: float) -> Any:
         node = ox.distance.nearest_nodes(self.graph, X=lng, Y=lat)
         return node
 
     def create_incident(self, lat: float, lng: float, severity: int) -> StateSnapshot:
-        """Snap to nearest node, create the Incident, assign the nearest
-        available vehicle by straight-line distance (temporary until
-        Prompt 8's true route-cost assignment), compute its route, and
-        create the Mission — all in one update cycle."""
+        """Snap to nearest node, create the Incident, run true route-cost
+        fleet assignment (Prompt 8), compute primary + backup routes, create
+        the Mission, and broadcast — all in one update cycle."""
         start = time.perf_counter()
 
         node_id = self.snap_to_node(lat, lng)
@@ -359,22 +467,36 @@ class GraphService:
         )
         self.incidents.append(incident)
 
-        vehicle = fleet.assign_nearest(self.vehicles, (lng, lat), self._node_coords)
-        if vehicle is not None:
-            route = compute_route(self.graph, int(vehicle.node_id), node_id)
-            self._mission_seq += 1
-            mission = Mission(
-                id=f"mission-{self._mission_seq}",
-                incident_id=incident.id,
-                vehicle_id=vehicle.id,
-                route=route,
-                eta_s=route.eta_s,
-                status="active",
-            )
+        self._mission_seq += 1
+        mission, reasons = fleet.assign(
+            incident,
+            self.graph,
+            self.vehicles,
+            self._node_coords,
+            self._mission_seq,
+        )
+        if mission is not None:
             self.missions.append(mission)
-            vehicle.status = "en_route"
-            vehicle.mission_id = mission.id
+            assigned_vehicle = next(v for v in self.vehicles if v.id == mission.vehicle_id)
+            assigned_vehicle.status = "en_route"
+            assigned_vehicle.mission_id = mission.id
             incident.status = "assigned"
+            self._add_decision(
+                kind="assignment",
+                headline=(
+                    f"{assigned_vehicle.callsign} dispatched to {incident.id} "
+                    f"— ETA {mission.eta_s:.0f}s"
+                )[:90],
+                reasons=reasons,
+                data={"mission_id": mission.id, "vehicle_id": assigned_vehicle.id},
+            )
+        else:
+            self._add_decision(
+                kind="assignment",
+                headline=f"No unit available for {incident.id} — all routes blocked or no vehicles free",
+                reasons=reasons,
+                data={"incident_id": incident.id},
+            )
 
         snapshot = self.build_snapshot(started_at=start)
         self.event_bus.emit("graph_changed", snapshot)
@@ -387,23 +509,89 @@ class GraphService:
         return next((i for i in self.incidents if i.id == incident_id), None)
 
     def _reassess_missions(self) -> None:
-        """Recompute the route for every active/rerouted mission. If it
-        becomes unreachable or its ETA worsens by more than the threshold,
-        update the mission's route and mark it rerouted."""
-        for mission in self.missions:
-            if mission.status not in ("active", "rerouted"):
-                continue
-            vehicle = self._vehicle_by_id(mission.vehicle_id)
-            incident = self._incident_by_id(mission.incident_id)
-            if vehicle is None or incident is None:
-                continue
-
-            new_route = compute_route(self.graph, int(vehicle.node_id), int(incident.node_id))
-            old_eta = mission.eta_s
-            worsened = not new_route.reachable or (
-                old_eta > 0 and new_route.eta_s > old_eta * REROUTE_ETA_WORSENING_THRESHOLD
+        """Prompt-8 fleet reassessment: recompute routes, reassign when
+        current route is unreachable or a better unit now beats ETA >25%,
+        and log every material decision."""
+        reassess_decisions = fleet.reassess_all(
+            self.graph,
+            self.vehicles,
+            self.missions,
+            self.incidents,
+            self._node_coords,
+        )
+        for rd in reassess_decisions:
+            if rd.action == "reassigned":
+                headline = (
+                    f"{rd.new_vehicle_callsign} reassigned to mission {rd.mission_id} "
+                    f"(replacing {rd.old_vehicle_callsign})"
+                )[:90]
+            elif rd.action == "rerouted":
+                headline = f"Mission {rd.mission_id} rerouted ({rd.old_vehicle_callsign})"
+            else:
+                headline = f"Mission {rd.mission_id} unreachable — no route available"
+            kind = "reroute" if rd.action in ("rerouted", "unreachable") else "assignment"
+            self._add_decision(
+                kind=kind,
+                headline=headline[:90],
+                reasons=rd.reasons,
+                data={"mission_id": rd.mission_id},
             )
-            if worsened:
-                mission.route = new_route
-                mission.eta_s = new_route.eta_s
-                mission.status = "rerouted"
+
+    def resolve_incident(self, incident_id: str) -> StateSnapshot:
+        """Resolve an incident, free its vehicle, mark mission complete, and broadcast."""
+        start = time.perf_counter()
+        incident = self._incident_by_id(incident_id)
+        if not incident:
+            return self.build_snapshot(started_at=start)
+
+        incident.status = "resolved"
+        # Find the active/rerouted mission for this incident
+        mission = next(
+            (m for m in self.missions if m.incident_id == incident_id and m.status in ("active", "rerouted", "reassigned")),
+            None
+        )
+        if mission:
+            mission.status = "complete"
+            vehicle = self._vehicle_by_id(mission.vehicle_id)
+            if vehicle:
+                vehicle.status = "available"
+                vehicle.mission_id = None
+            self._add_decision(
+                kind="assignment",
+                headline=f"Incident {incident_id} resolved — mission complete",
+                reasons=[f"Incident {incident_id} marked as resolved.", f"Vehicle {vehicle.callsign if vehicle else 'unknown'} returned to available status."],
+                data={"incident_id": incident_id, "mission_id": mission.id},
+            )
+        else:
+            self._add_decision(
+                kind="assignment",
+                headline=f"Incident {incident_id} resolved",
+                reasons=[f"Incident {incident_id} marked as resolved."],
+                data={"incident_id": incident_id},
+            )
+
+        snapshot = self.build_snapshot(started_at=start)
+        self.event_bus.emit("graph_changed", snapshot)
+        return snapshot
+
+    async def reset_state(self) -> None:
+        """Reset the system back to the pristine state by reloading GraphML and annotations."""
+        self.graph = load_graph(GRAPH_PATH)
+        self.zones, self.pois = load_annotations(self.graph, DEMO_AREA_PATH)
+        self._edge_index = _index_edges(self.graph)
+        self.vehicles = fleet.seed_vehicles(self.zones, self._node_coords)
+        self.incidents = []
+        self.missions = []
+        self.decisions = []
+        self.latest_impact = None
+        self._components_cache = impact.compute_components(self.graph)
+        self._seq = 0
+        self._incident_seq = 0
+        self._mission_seq = 0
+        self._decision_seq = 0
+        self._add_decision(
+            kind="assignment",
+            headline="System state reset to pristine configuration",
+            reasons=["All flooded segments cleared.", "All active incidents and missions terminated."],
+        )
+

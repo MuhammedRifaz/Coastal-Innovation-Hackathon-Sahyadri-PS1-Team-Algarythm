@@ -17,6 +17,8 @@ from app.core.graph_service import GraphService
 from app.models import StateSnapshot
 from app.ws.manager import ConnectionManager
 
+from app.core.scenario import ScenarioRunner
+
 manager = ConnectionManager()
 
 
@@ -26,6 +28,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     graph_service.load()
     app.state.graph_service = graph_service
 
+    async def ws_broadcast(snapshot) -> None:
+        await manager.broadcast(snapshot.model_dump(mode="json"))
+
+    scenario_runner = ScenarioRunner(graph_service, ws_broadcast)
+    app.state.scenario_runner = scenario_runner
+
     def on_graph_changed(snapshot: StateSnapshot) -> None:
         asyncio.get_running_loop().create_task(
             manager.broadcast(snapshot.model_dump(mode="json"))
@@ -33,6 +41,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     graph_service.event_bus.on("graph_changed", on_graph_changed)
     yield
+    scenario_runner.cancel()
 
 
 app = FastAPI(title="ResQOS", lifespan=lifespan)
