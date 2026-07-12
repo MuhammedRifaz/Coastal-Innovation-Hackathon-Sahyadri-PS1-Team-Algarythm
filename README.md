@@ -10,6 +10,11 @@
 >
 > ResQOS is a next-generation **Emergency Response Decision Support Platform** designed for local Emergency Operations Centers (EOC) during extreme monsoon events. Unlike a consumer navigation app, it models the road network as a *dynamic, semantic graph* that updates in real-time, analyzes cascade infrastructure failures, optimizes emergency fleet routing by true operational cost, and explains its reasoning in plain language.
 
+<div align="center">
+  <video src="Video/Recording 2026-07-12 122056.mp4" width="100%" controls autoplay loop muted></video>
+  <p><em>ResQOS in Action: Real-time decision support, risk-aware routing, impact analysis, and fleet dispatch simulation.</em></p>
+</div>
+
 ---
 
 ## 🏆 Why ResQOS Wins (The Hackathon Competitive Edge)

@@ -1,239 +1,182 @@
-// MissionPanel — inline sidebar section showing active mission cards.
-// No absolute positioning — parent sidebar controls placement.
-// Cards: callsign · kind badge · status chip · ETA (large mono) · risk chip
-// Expand "Why?" → reasons list + backup route indicator.
-// Hover → store notifies MapView to highlight/dim routes.
-
-import { useCallback } from "react";
-import { AnimatePresence, motion } from "motion/react";
+// Right-side stack of active mission cards: unit, incident, ETA, risk,
+// status, and an expandable "Why" section. Hovering a card tells
+// MapView (via the store) to highlight its route and dim the rest;
+// expanding a card also reveals its backup route as a dashed 50%-opacity
+// line on the map.
+import { motion } from "motion/react";
 import { useAppStore } from "../store/useAppStore";
 import { postResolveIncident } from "../lib/api";
-import type { Mission, Vehicle, Incident } from "../lib/types";
+import type { VehicleKind } from "../lib/types";
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-function fmtEta(eta_s: number): string {
-  if (eta_s <= 0) return "—";
-  const m = Math.floor(eta_s / 60);
-  const s = Math.round(eta_s % 60);
-  return m > 0 ? `${m}m ${s.toString().padStart(2, "0")}s` : `${s}s`;
-}
-
-const RISK_LEVELS = [
-  { max: 15, label: "LOW", bg: "bg-eoc-safe/15", text: "text-eoc-safe", border: "border-eoc-safe/30" },
-  { max: 45, label: "MED", bg: "bg-eoc-risky/15", text: "text-eoc-risky", border: "border-eoc-risky/30" },
-  { max: 101, label: "HIGH", bg: "bg-eoc-alert/15", text: "text-eoc-alert", border: "border-eoc-alert/30" },
-];
-
-function riskChip(score: number) {
-  return RISK_LEVELS.find((r) => score < r.max) ?? RISK_LEVELS[2];
-}
-
-const STATUS_MAP: Record<string, { label: string; cls: string }> = {
-  active:     { label: "Active",      cls: "bg-eoc-safe/15 text-eoc-safe" },
-  rerouted:   { label: "Rerouted",    cls: "bg-eoc-risky/15 text-eoc-risky" },
-  reassigned: { label: "Reassigned",  cls: "bg-eoc-route/15 text-eoc-route" },
-  complete:   { label: "Complete",    cls: "bg-white/5 text-eoc-text/40" },
-};
-
-// ── MissionCard ───────────────────────────────────────────────────────────────
-
-interface CardProps {
-  mission: Mission;
-  vehicle: Vehicle | undefined;
-  incident: Incident | undefined;
-  isHovered: boolean;
-  isExpanded: boolean;
-  backupVehicle: Vehicle | undefined;
-  onHoverEnter: () => void;
-  onHoverLeave: () => void;
-  onToggleExpand: () => void;
-}
-
-function MissionCard({
-  mission, vehicle, incident, isHovered, isExpanded,
-  backupVehicle, onHoverEnter, onHoverLeave, onToggleExpand,
-}: CardProps) {
-  const risk = riskChip(mission.route.risk_score);
-  const status = STATUS_MAP[mission.status] ?? { label: mission.status, cls: "bg-white/5 text-eoc-text/40" };
-  const reachable = mission.route.reachable;
-
+function VehicleIcon({ kind }: { kind: VehicleKind }) {
+  if (kind === "ambulance") {
+    return (
+      <svg width="32" height="32" viewBox="0 0 20 20" fill="none" className="shrink-0">
+        <rect x="1" y="6" width="14" height="9" rx="1.5" fill="#38BDF8" fillOpacity="0.2" stroke="#38BDF8" strokeWidth="1.5"/>
+        <rect x="15" y="9" width="4" height="6" rx="1" fill="#38BDF8" fillOpacity="0.2" stroke="#38BDF8" strokeWidth="1.5"/>
+        <circle cx="4.5" cy="15.5" r="1.8" fill="#38BDF8"/>
+        <circle cx="12.5" cy="15.5" r="1.8" fill="#38BDF8"/>
+        <rect x="6" y="8.5" width="1.4" height="4.5" rx="0.7" fill="#38BDF8"/>
+        <rect x="4.4" y="10.1" width="4" height="1.4" rx="0.7" fill="#38BDF8"/>
+        <rect x="1.5" y="7.5" width="4" height="2" rx="0.5" fill="#38BDF8" fillOpacity="0.6"/>
+        <circle cx="8" cy="10.5" r="1.5" fill="#38BDF8" fillOpacity="0.3"/>
+      </svg>
+    );
+  }
   return (
-    <motion.div
-      layout
-      initial={{ opacity: 0, x: 20 }}
-      animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: 20 }}
-      transition={{ type: "spring", stiffness: 320, damping: 32 }}
-      onMouseEnter={onHoverEnter}
-      onMouseLeave={onHoverLeave}
-      className={[
-        "rounded-lg border p-3 transition-all duration-200 cursor-default select-none",
-        "bg-[rgba(17,24,32,0.7)] backdrop-blur",
-        isHovered
-          ? "border-eoc-route/50 shadow-[0_0_16px_rgba(56,189,248,0.15)]"
-          : "border-white/[0.07] hover:border-white/15",
-      ].join(" ")}
-    >
-      {/* ── top row: callsign + status ── */}
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="font-mono text-sm font-bold text-eoc-route truncate">
-            {vehicle?.callsign ?? mission.vehicle_id}
-          </span>
-          {vehicle && (
-            <span className="shrink-0 rounded border border-white/10 px-1 font-mono text-[9px] uppercase tracking-wider text-eoc-text/35">
-              {vehicle.kind === "ambulance" ? "AMB" : "RSC"}
-            </span>
-          )}
-        </div>
-        <span className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider ${status.cls}`}>
-          {status.label}
-        </span>
-      </div>
-
-      {/* ── ETA + risk ── */}
-      <div className="mt-2 flex items-end gap-2">
-        <span className={`font-mono text-2xl font-bold tabular-nums leading-none ${reachable ? "text-eoc-text" : "text-eoc-alert"}`}>
-          {reachable ? fmtEta(mission.eta_s) : "BLOCKED"}
-        </span>
-        <div className="flex-1" />
-        <span className={`shrink-0 rounded border px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase ${risk.bg} ${risk.text} ${risk.border}`}>
-          {risk.label} risk
-        </span>
-      </div>
-
-      {/* ── incident ref ── */}
-      {incident && (
-        <div className="mt-1 flex items-center justify-between gap-2 border-t border-white/[0.04] pt-1.5">
-          <p className="font-mono text-[10px] text-eoc-text/35 truncate">
-            Incident {incident.id} · severity {incident.severity}
-          </p>
-          {incident.status !== "resolved" && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                postResolveIncident(incident.id).catch((err) =>
-                  console.error("resolve incident failed", err),
-                );
-              }}
-              className="text-[9px] font-mono uppercase tracking-widest text-eoc-safe hover:text-white transition-colors px-1.5 py-0.5 rounded border border-eoc-safe/30 hover:bg-eoc-safe hover:border-eoc-safe cursor-pointer"
-            >
-              Resolve
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* ── Why toggle ── */}
-      {(mission.reasons ?? []).length > 0 && (
-        <button
-          id={`why-${mission.id}`}
-          onClick={onToggleExpand}
-          className="mt-2.5 flex w-full items-center gap-1 border-t border-white/[0.06] pt-2 text-left
-                     font-mono text-[10px] uppercase tracking-widest text-eoc-text/35
-                     transition-colors hover:text-eoc-route"
-        >
-          <svg
-            className={`h-2.5 w-2.5 shrink-0 transition-transform duration-200 ${isExpanded ? "rotate-90" : ""}`}
-            fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 12 12"
-          >
-            <path d="M4 2l4 4-4 4" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-          Why this unit?
-        </button>
-      )}
-
-      {/* ── Reasons ── */}
-      <AnimatePresence>
-        {isExpanded && (
-          <motion.div
-            key="reasons"
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2, ease: "easeInOut" }}
-            className="overflow-hidden"
-          >
-            <ul className="mt-2 space-y-1">
-              {(mission.reasons ?? []).map((r, i) => (
-                <li key={i} className="flex gap-1.5 text-[10px] leading-relaxed text-eoc-text/60">
-                  <span className="mt-px shrink-0 text-eoc-route/50">›</span>
-                  <span>{r}</span>
-                </li>
-              ))}
-            </ul>
-
-            {mission.backup_route?.reachable && (
-              <div className="mt-2 flex items-center gap-1.5 rounded border border-eoc-route/20 bg-eoc-route/5 px-2 py-1.5">
-                <svg className="h-2.5 w-2.5 shrink-0 text-eoc-route/60" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 12 12">
-                  <path d="M2 6h8M7 3l3 3-3 3" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-                <span className="font-mono text-[10px] text-eoc-route/70">
-                  Backup{backupVehicle ? ` · ${backupVehicle.callsign}` : ""} · ETA {fmtEta(mission.backup_route.eta_s)}
-                </span>
-                <span className="ml-auto font-mono text-[9px] uppercase tracking-wider text-eoc-route/35">dashed on map</span>
-              </div>
-            )}
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </motion.div>
+    <svg width="32" height="32" viewBox="0 0 20 20" fill="none" className="shrink-0">
+      <rect x="1" y="7" width="16" height="8" rx="1.5" fill="#22C55E" fillOpacity="0.2" stroke="#22C55E" strokeWidth="1.5"/>
+      <rect x="12" y="5" width="5" height="5" rx="1" fill="#22C55E" fillOpacity="0.2" stroke="#22C55E" strokeWidth="1.5"/>
+      <circle cx="4.5" cy="15.5" r="1.8" fill="#22C55E"/>
+      <circle cx="13.5" cy="15.5" r="1.8" fill="#22C55E"/>
+      <rect x="1" y="9" width="10" height="2" rx="0.5" fill="#22C55E" fillOpacity="0.3"/>
+      <rect x="3" y="10" width="6" height="1" rx="0.3" fill="#22C55E" fillOpacity="0.4"/>
+    </svg>
   );
 }
 
-// ── MissionPanel ──────────────────────────────────────────────────────────────
+const STATUS_LABEL: Record<string, string> = {
+  active: "🚀 Active",
+  rerouted: "⚠️ Rerouted",
+  reassigned: "🔄 Reassigned",
+  complete: "✅ Complete",
+};
+
+const STATUS_COLOR: Record<string, string> = {
+  active: "text-eoc-safe",
+  rerouted: "text-eoc-risky",
+  reassigned: "text-eoc-route",
+  complete: "text-eoc-text/40",
+};
+
+const STATUS_BG: Record<string, string> = {
+  active: "bg-eoc-safe/20 border-eoc-safe/40",
+  rerouted: "bg-eoc-risky/20 border-eoc-risky/40",
+  reassigned: "bg-eoc-route/20 border-eoc-route/40",
+  complete: "bg-white/10 border-white/20",
+};
+
+function riskChipColor(risk: number): string {
+  if (risk >= 50) return "bg-eoc-blocked/20 text-eoc-blocked border-eoc-blocked/40";
+  if (risk > 0) return "bg-eoc-risky/20 text-eoc-risky border-eoc-risky/40";
+  return "bg-eoc-safe/20 text-eoc-safe border-eoc-safe/40";
+}
 
 export function MissionPanel() {
-  const missions = useAppStore((s) => s.missions);
+  const allMissions = useAppStore((s) => s.missions);
+  const missions = allMissions.filter((m) => m.status !== "complete");
   const vehicles = useAppStore((s) => s.vehicles);
   const incidents = useAppStore((s) => s.incidents);
-  const hoveredMissionId = useAppStore((s) => s.hoveredMissionId);
   const expandedMissionId = useAppStore((s) => s.expandedMissionId);
   const setHoveredMissionId = useAppStore((s) => s.setHoveredMissionId);
   const setExpandedMissionId = useAppStore((s) => s.setExpandedMissionId);
 
-  const active = missions.filter((m) =>
-    m.status === "active" || m.status === "rerouted" || m.status === "reassigned"
-  );
-
-  const byId = <T extends { id: string }>(arr: T[], id: string) => arr.find((x) => x.id === id);
-
-  const backupVehicleFor = useCallback(
-    (m: Mission) =>
-      m.backup_route
-        ? vehicles.find((v) => v.status === "available" && v.id !== m.vehicle_id)
-        : undefined,
-    [vehicles]
-  );
-
-  if (active.length === 0) {
+  if (missions.length === 0) {
     return (
-      <div className="rounded-lg border border-white/[0.06] bg-[rgba(17,24,32,0.5)] p-3 text-center">
-        <p className="font-mono text-[10px] uppercase tracking-widest text-eoc-text/25">No active missions</p>
-        <p className="mt-1 text-[10px] text-eoc-text/20">Click the map to create an incident</p>
+      <div className="pointer-events-none w-[340px]">
+        <div className="pointer-events-auto rounded-2xl border border-white/10 bg-[#0d1117]/95 p-5 text-center backdrop-blur-xl">
+          <span className="text-3xl">🎯</span>
+          <p className="mt-2 text-xs text-eoc-text/50">No active missions</p>
+          <p className="mt-1 text-[10px] text-eoc-text/30">Click the map to report an incident</p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="space-y-2">
-      <AnimatePresence mode="popLayout">
-        {active.map((m) => (
-          <MissionCard
-            key={m.id}
-            mission={m}
-            vehicle={byId(vehicles, m.vehicle_id)}
-            incident={byId(incidents, m.incident_id)}
-            isHovered={hoveredMissionId === m.id}
-            isExpanded={expandedMissionId === m.id}
-            backupVehicle={backupVehicleFor(m)}
-            onHoverEnter={() => setHoveredMissionId(m.id)}
-            onHoverLeave={() => setHoveredMissionId(null)}
-            onToggleExpand={() => setExpandedMissionId(m.id)}
-          />
-        ))}
-      </AnimatePresence>
+    <div className="pointer-events-none flex max-h-[65vh] w-[340px] flex-col gap-3 overflow-y-auto">
+      {missions.map((mission) => {
+        const vehicle = vehicles.find((v) => v.id === mission.vehicle_id);
+        const incident = incidents.find((i) => i.id === mission.incident_id);
+        const isExpanded = expandedMissionId === mission.id;
+
+        return (
+          <motion.div
+            key={mission.id}
+            layout
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            onMouseEnter={() => setHoveredMissionId(mission.id)}
+            onMouseLeave={() => setHoveredMissionId(null)}
+            className={`pointer-events-auto rounded-2xl border p-4 text-eoc-text backdrop-blur-xl transition-all ${
+              isExpanded ? 'border-eoc-route/50 bg-[#0d1117]/98' : 'border-white/10 bg-[#0d1117]/95 hover:border-eoc-route/30'
+            }`}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className={`rounded-xl p-2 ${vehicle?.kind === 'ambulance' ? 'bg-sky-500/20' : 'bg-green-500/20'}`}>
+                  {vehicle && <VehicleIcon kind={vehicle.kind} />}
+                </div>
+                <div>
+                  <div className="font-mono text-base font-bold">{vehicle?.callsign ?? "Unassigned"}</div>
+                  <div className="text-[10px] font-semibold uppercase text-eoc-text/50">{vehicle?.kind.replace("_", " ") ?? ""}</div>
+                </div>
+              </div>
+              <div className={`rounded-lg border px-2 py-1 font-mono text-[10px] font-bold uppercase ${STATUS_BG[mission.status] ?? ""} ${STATUS_COLOR[mission.status] ?? ""}`}>
+                {STATUS_LABEL[mission.status] ?? mission.status}
+              </div>
+            </div>
+
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <div className="rounded-lg bg-white/5 p-2">
+                <div className="text-[9px] uppercase text-eoc-text/40">Incident</div>
+                <div className="font-mono text-xs font-semibold">{incident?.id ?? mission.incident_id}</div>
+              </div>
+              <div className="rounded-lg bg-white/5 p-2">
+                <div className="text-[9px] uppercase text-eoc-text/40">ETA</div>
+                <div className="font-mono text-xs font-bold">{mission.eta_s.toFixed(0)}s</div>
+              </div>
+            </div>
+
+            <div className="mt-3 flex items-center justify-between">
+              <span className={`rounded-lg border px-2 py-1 font-mono text-[10px] font-bold ${riskChipColor(mission.route.risk_score)}`}>
+                Risk: {mission.route.risk_score.toFixed(0)}
+              </span>
+              <span className="text-[10px] text-eoc-text/50">Distance: {(mission.route.distance_m / 1000).toFixed(1)}km</span>
+            </div>
+
+            {incident && (
+              <button
+                onClick={() => postResolveIncident(incident.id).catch((err) => console.error("resolve failed", err))}
+                className="mt-3 w-full rounded-xl border border-white/10 bg-white/5 py-2 text-[10px] font-bold uppercase tracking-wide text-eoc-text/70 transition-all hover:border-eoc-safe/50 hover:bg-eoc-safe/10 hover:text-eoc-safe"
+              >
+                ✅ Mark Resolved
+              </button>
+            )}
+
+            <button
+              onClick={() => setExpandedMissionId(isExpanded ? null : mission.id)}
+              className="mt-2 flex w-full items-center justify-between text-[10px] font-semibold uppercase tracking-wide text-eoc-text/50 hover:text-eoc-text transition-colors"
+            >
+              <span>💡 Why this route?</span>
+              <span className="text-lg">{isExpanded ? "▲" : "▼"}</span>
+            </button>
+
+            {isExpanded && (
+              <motion.ul
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                className="mt-2 space-y-2 overflow-hidden rounded-lg bg-white/5 p-3 text-xs"
+              >
+                {mission.reasons.length === 0 && <li className="text-eoc-text/40 italic">No reasons recorded.</li>}
+                {mission.reasons.map((reason) => (
+                  <li key={reason} className="flex items-start gap-2 text-eoc-text/80">
+                    <span className="mt-0.5 text-eoc-route">•</span>
+                    <span>{reason}</span>
+                  </li>
+                ))}
+                {mission.backup_route && (
+                  <li className="flex items-start gap-2 text-eoc-route font-semibold">
+                    <span className="mt-0.5">🔄</span>
+                    <span>Backup route available (shown dashed on map)</span>
+                  </li>
+                )}
+              </motion.ul>
+            )}
+          </motion.div>
+        );
+      })}
     </div>
   );
 }

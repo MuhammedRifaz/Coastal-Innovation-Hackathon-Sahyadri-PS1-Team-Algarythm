@@ -17,14 +17,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import math
+
 import networkx as nx
 import osmnx as ox
 
-from app.core import fleet, impact
+from app.core import fleet, impact, safezones
+from app.core.routing import compute_route
+from app.core.scenario import ScenarioRunner
 from app.models import POI, Decision, ImpactReport, Incident, Mission, StateSnapshot, Vehicle, Zone
 
-# Maximum number of Decision entries kept in the snapshot.
-MAX_DECISIONS = 50
+MAX_DECISION_LOG = 50
+
+# Nethravathi river center — elevation baseline for simulation.
+RIVER_CENTER_LAT = 12.835
+RIVER_CENTER_LNG = 74.852
+EARTH_RADIUS_M = 6371000.0
+
+
+def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _simulated_elevation(lat: float, lng: float) -> float:
+    """Simulate elevation (metres) for Mangaluru–Ullal area.
+    Nethravathi river bed ≈ 3 m; rises ~8 m per km away from the river,
+    capped at 40 m.  Coastal northern reach stays a little lower."""
+    dist_m = _haversine_m(lat, lng, RIVER_CENTER_LAT, RIVER_CENTER_LNG)
+    base = 3.0 + (dist_m / 1000.0) * 8.0
+    if lat > 12.87:
+        base *= 0.75
+    return min(max(base, 2.0), 40.0)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GRAPH_PATH = REPO_ROOT / "data" / "demo_graph.graphml"
@@ -104,6 +131,10 @@ def load_graph(graph_path: Path = GRAPH_PATH) -> nx.MultiDiGraph:
     graph = ox.load_graphml(graph_path)
     now = datetime.now(timezone.utc).isoformat()
 
+    # Tag each node with a simulated elevation first so edges can inherit it.
+    for node, data in graph.nodes(data=True):
+        data["elevation_m"] = _simulated_elevation(float(data["y"]), float(data["x"]))
+
     for u, v, k, data in graph.edges(keys=True, data=True):
         length_m = float(data.get("length", 0.0))
         travel_time = data.get("travel_time")
@@ -112,15 +143,29 @@ def load_graph(graph_path: Path = GRAPH_PATH) -> nx.MultiDiGraph:
             if travel_time is not None
             else length_m / (DEFAULT_SPEED_KPH * 1000 / 3600)
         )
+        u_elev = graph.nodes[u].get("elevation_m", 10.0)
+        v_elev = graph.nodes[v].get("elevation_m", 10.0)
+        elevation_m = (u_elev + v_elev) / 2.0
+        # Safety score: lower elevation roads are more flood-vulnerable.
+        # 3 m → score 55; 20 m → score 90; 40 m → score 100.
+        safety_score = min(100, max(20, int(50 + elevation_m * 2.5)))
         data["edge_id"] = f"{u}_{v}_{k}"
         data["length_m"] = length_m
         data["base_time_s"] = base_time_s
         data["highway_class"] = _highway_class(data.get("highway"))
         data["flood_depth_cm"] = 0.0
         data["status"] = _edge_status(0.0)
-        data["safety_score"] = 100
+        data["safety_score"] = safety_score
+        data["elevation_m"] = round(elevation_m, 1)
         data["critical"] = False
         data["updated_at"] = now
+        data["rainfall_flooded"] = False
+        # Confidence in flood report (0-100%): 100% = confirmed by sensors,
+        # 50% = citizen report, 0% = no data. Default to 100% (no uncertainty).
+        data["confidence"] = 100
+        # at_risk: True if this edge is predicted to flood soon based on
+        # proximity to currently flooded edges (contagion model heuristic).
+        data["at_risk"] = False
 
     _mark_critical_edges(graph)
     return graph
@@ -205,8 +250,11 @@ def graph_to_geojson(graph: nx.MultiDiGraph) -> dict[str, Any]:
                     "flood_depth_cm": data["flood_depth_cm"],
                     "status": data["status"],
                     "safety_score": data["safety_score"],
+                    "elevation_m": data.get("elevation_m", 10.0),
                     "critical": data["critical"],
                     "updated_at": data["updated_at"],
+                    "confidence": data.get("confidence", 100),
+                    "at_risk": data.get("at_risk", False),
                 },
             }
         )
@@ -231,6 +279,10 @@ class EdgeNotFoundError(KeyError):
     """Raised by apply_flood/clear_flood when edge_id doesn't exist."""
 
 
+class IncidentNotFoundError(KeyError):
+    """Raised by resolve_incident when incident_id doesn't exist."""
+
+
 class EventBus:
     """Tiny synchronous pub/sub. emit() calls every subscriber immediately,
     in-process — no async, no queue, no external broker. Subscribers that
@@ -252,11 +304,43 @@ def _index_edges(graph: nx.MultiDiGraph) -> dict[str, tuple[Any, Any, Any]]:
     return {data["edge_id"]: (u, v, k) for u, v, k, data in graph.edges(keys=True, data=True)}
 
 
-def _set_edge_flood(graph: nx.MultiDiGraph, u: Any, v: Any, k: Any, depth_cm: float) -> None:
+def _set_edge_flood(graph: nx.MultiDiGraph, u: Any, v: Any, k: Any, depth_cm: float, confidence: int = 100) -> None:
     data = graph[u][v][k]
     data["flood_depth_cm"] = float(depth_cm)
     data["status"] = _edge_status(depth_cm)
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    data["confidence"] = confidence
+
+
+def _update_flood_propagation(graph: nx.MultiDiGraph, propagation_radius_m: float = 50.0) -> set[str]:
+    """Simple contagion model: mark edges adjacent to flooded edges as at_risk.
+    Uses graph topology instead of distance for O(n) performance.
+    Returns set of edge_ids that changed status."""
+    # Get all currently flooded edge nodes
+    flooded_nodes = set()
+    for u, v, k, data in graph.edges(keys=True, data=True):
+        if data.get("flood_depth_cm", 0) > 0:
+            flooded_nodes.add(u)
+            flooded_nodes.add(v)
+    
+    # Clear existing at_risk flags
+    changed_edges = set()
+    for u, v, k, data in graph.edges(keys=True, data=True):
+        if data.get("at_risk", False):
+            data["at_risk"] = False
+            changed_edges.add(data["edge_id"])
+    
+    # Mark edges adjacent to flooded nodes as at_risk
+    for node in flooded_nodes:
+        # Check all edges connected to this node
+        for u, v, k, data in graph.edges(node, keys=True, data=True):
+            if data.get("flood_depth_cm", 0) > 0:
+                continue  # Skip already flooded edges
+            
+            data["at_risk"] = True
+            changed_edges.add(data["edge_id"])
+    
+    return changed_edges
 
 
 class GraphService:
@@ -276,10 +360,12 @@ class GraphService:
         self._edge_index: dict[str, tuple[Any, Any, Any]] = {}
         self._node_coords: dict[Any, tuple[float, float]] = {}
         self._components_cache: dict[Any, int] = {}
+        self._safe_zone_assignments: dict[str, safezones.SafeZoneAssignment] = {}
         self._seq = 0
         self._incident_seq = 0
         self._mission_seq = 0
         self._decision_seq = 0
+        self.scenario = ScenarioRunner(self._apply_scenario_step)
 
     def load(
         self,
@@ -294,6 +380,64 @@ class GraphService:
         }
         self.vehicles = fleet.seed_vehicles(self.zones, self._node_coords)
         self._components_cache = impact.compute_components(self.graph)
+        self._safe_zone_assignments = safezones.map_safe_zones(self.graph, self.zones, self.pois)
+
+    def _apply_scenario_step(self, step: dict[str, Any]) -> None:
+        action = step["action"]
+        params = step.get("params", {})
+        if action == "incident":
+            self.create_incident(params["lat"], params["lng"], params["severity"])
+        elif action == "flood":
+            self.apply_flood(params["edge_id"], params["depth_cm"])
+        elif action == "flood_clear":
+            self.clear_flood(params["edge_id"])
+        elif action == "rainfall":
+            self.apply_rainfall(params["rainfall_mm"])
+
+    def start_scenario(self) -> None:
+        self.scenario.start()
+        self._log_decision("assignment", "Monsoon Surge scenario started")
+        snapshot = self.build_snapshot()
+        self.event_bus.emit("graph_changed", snapshot)
+
+    def reset(self, graph_path: Path = GRAPH_PATH, demo_area_path: Path = DEMO_AREA_PATH) -> StateSnapshot:
+        """Stop any running scenario, reload the pristine graph (discarding
+        all flood mutations), and clear incidents/missions/decisions."""
+        self.scenario.stop()
+        self.load(graph_path, demo_area_path)
+        self.incidents = []
+        self.missions = []
+        self.decisions = []
+        self.latest_impact = None
+        self._seq = 0
+        self._incident_seq = 0
+        self._mission_seq = 0
+        self._decision_seq = 0
+        self._log_decision("assignment", "Scenario reset — pristine state restored")
+        snapshot = self.build_snapshot()
+        self.event_bus.emit("graph_changed", snapshot)
+        return snapshot
+
+    def _log_decision(
+        self,
+        kind: str,
+        headline: str,
+        reasons: list[str] | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        self._decision_seq += 1
+        self.decisions.append(
+            Decision(
+                id=f"decision-{self._decision_seq}",
+                ts=datetime.now(timezone.utc),
+                kind=kind,  # type: ignore[arg-type]
+                headline=headline[:90],
+                reasons=reasons or [],
+                data=data or {},
+            )
+        )
+        if len(self.decisions) > MAX_DECISION_LOG:
+            self.decisions = self.decisions[-MAX_DECISION_LOG:]
 
     def to_geojson(self) -> dict[str, Any]:
         assert self.graph is not None, "GraphService.load() must run before use"
@@ -304,29 +448,6 @@ class GraphService:
             return self._edge_index[edge_id]
         except KeyError:
             raise EdgeNotFoundError(edge_id) from None
-
-    def _add_decision(
-        self,
-        kind: str,
-        headline: str,
-        reasons: list[str],
-        data: dict[str, Any] | None = None,
-    ) -> None:
-        """Append a Decision to the ring buffer (capped at MAX_DECISIONS)."""
-        self._decision_seq += 1
-        from app.models import DecisionKind  # local to avoid circular at module level
-        self.decisions.append(
-            Decision(
-                id=f"decision-{self._decision_seq}",
-                ts=datetime.now(timezone.utc),
-                kind=kind,  # type: ignore[arg-type]
-                headline=headline,
-                reasons=reasons,
-                data=data or {},
-            )
-        )
-        if len(self.decisions) > MAX_DECISIONS:
-            self.decisions = self.decisions[-MAX_DECISIONS:]
 
     def build_snapshot(self, started_at: float | None = None) -> StateSnapshot:
         """Assemble the full StateSnapshot. `started_at` lets a caller that
@@ -348,21 +469,37 @@ class GraphService:
             pois=self.pois,
             zones=self.zones,
             latest_impact=self.latest_impact,
-            safe_zone_map={},
-            decisions=list(self.decisions),
+            safe_zone_map={k: v.model_dump() for k, v in self._safe_zone_assignments.items()},
+            decisions=self.decisions[-MAX_DECISION_LOG:],
         )
 
-    def _apply_flood_and_analyze(self, edge_id: str, depth_cm: float, start: float) -> StateSnapshot:
+    def _apply_flood_and_analyze(self, edge_id: str, depth_cm: float, confidence: int = 100, start: float | None = None) -> StateSnapshot:
         group = _edges_in_group(edge_id)
         group_locations = [self._lookup_edge(eid) for eid in group]
         old_statuses = [self.graph[u][v][k]["status"] for u, v, k in group_locations]
+        old_depths = [self.graph[u][v][k]["flood_depth_cm"] for u, v, k in group_locations]
 
         for u, v, k in group_locations:
-            _set_edge_flood(self.graph, u, v, k, depth_cm)
+            _set_edge_flood(self.graph, u, v, k, depth_cm, confidence)
         new_statuses = [self.graph[u][v][k]["status"] for u, v, k in group_locations]
+        new_depths = [self.graph[u][v][k]["flood_depth_cm"] for u, v, k in group_locations]
+
+        # Note: Flood propagation prediction disabled in hot path for performance.
+        # Can be triggered via separate API endpoint if needed.
 
         mission_etas_before = {m.id: m.eta_s for m in self.missions}
-        self._reassess_missions()
+        reassessment_reasons = fleet.reassess_all(self.graph, self.missions, self.vehicles, self.incidents)
+        for reason in reassessment_reasons:
+            self._log_decision("reroute", reason, reasons=[reason])
+
+        # Recompute safe zone assignments
+        old_safe_assignments = self._safe_zone_assignments.copy()
+        self._safe_zone_assignments = safezones.map_safe_zones(self.graph, self.zones, self.pois)
+        safe_zone_reasons = safezones.detect_safe_zone_changes(
+            old_safe_assignments, self._safe_zone_assignments, self.zones, self.pois
+        )
+        for reason in safe_zone_reasons:
+            self._log_decision("safezone", "Safe zone mapping changed", reasons=[reason])
 
         # A group only actually changes the passable subgraph when it goes
         # from "not fully blocked" to "fully blocked" (or the reverse) —
@@ -371,7 +508,9 @@ class GraphService:
         was_severed = all(status == "blocked" for status in old_statuses)
         is_severed = all(status == "blocked" for status in new_statuses)
 
-        if is_severed and not was_severed:
+        # Run impact analysis for any flood (not just when severed)
+        # to provide warnings about potential infrastructure impact
+        if any(depth > 0 for depth in new_depths):
             report = impact.analyze_impact(
                 self.graph,
                 edge_id,
@@ -379,25 +518,46 @@ class GraphService:
                 self.pois,
                 self.missions,
                 self.vehicles,
-                self._node_coords,
                 self._components_cache,
                 mission_etas_before,
             )
             self._components_cache = impact.compute_components(self.graph)
             self.latest_impact = report
+            if is_severed and not was_severed:
+                # Critical alert: road fully blocked
+                if report.isolated_zones:
+                    headline = (
+                        f"{edge_id} CLOSED — {len(report.isolated_zones)} zone(s), "
+                        f"~{report.affected_population} residents affected"
+                    )
+                else:
+                    headline = f"{edge_id} closed — no zone lost hospital access"
+                self._log_decision("impact", headline, reasons=[report.recommendation], data={"closed_edge": edge_id})
+            else:
+                # Warning: road flooded but still passable
+                headline = (
+                    f"{edge_id} flooded ({max(new_depths):.0f}cm) — "
+                    f"{'CRITICAL' if is_severed else 'WARNING'}: {report.recommendation[:100]}..."
+                )
+                self._log_decision("impact", headline, reasons=[report.recommendation], data={"closed_edge": edge_id})
         elif was_severed and not is_severed:
+            self._components_cache = impact.compute_components(self.graph)
+            self.latest_impact = None
+            self._log_decision("impact", f"{edge_id} reopened — network reconnected")
+        elif any(depth > 0 for depth in old_depths) and all(depth == 0 for depth in new_depths):
+            # Flood cleared
             self._components_cache = impact.compute_components(self.graph)
             self.latest_impact = None
 
         return self.build_snapshot(started_at=start)
 
-    def apply_flood(self, edge_id: str, depth_cm: float) -> StateSnapshot:
+    def apply_flood(self, edge_id: str, depth_cm: float, confidence: int = 100) -> StateSnapshot:
         """Mutate the edge in place, reassess active missions and run
         impact analysis against the new graph, build one snapshot for the
         whole update cycle, and emit it on graph_changed so subscribers
         (the WS broadcaster) can push the exact same snapshot to clients."""
         start = time.perf_counter()
-        snapshot = self._apply_flood_and_analyze(edge_id, depth_cm, start)
+        snapshot = self._apply_flood_and_analyze(edge_id, depth_cm, confidence, start)
         self.event_bus.emit("graph_changed", snapshot)
         return snapshot
 
@@ -436,7 +596,6 @@ class GraphService:
             self.pois,
             self.missions,
             self.vehicles,
-            self._node_coords,
             self._components_cache,
             mission_etas_before,
         )
@@ -446,9 +605,10 @@ class GraphService:
         return node
 
     def create_incident(self, lat: float, lng: float, severity: int) -> StateSnapshot:
-        """Snap to nearest node, create the Incident, run true route-cost
-        fleet assignment (Prompt 8), compute primary + backup routes, create
-        the Mission, and broadcast — all in one update cycle."""
+        """Snap to nearest node, create the Incident, assign the best
+        available vehicle by true route cost (Prompt 8 — replaces the
+        Prompt 6 straight-line-nearest logic), compute its route + a
+        backup, and create the Mission — all in one update cycle."""
         start = time.perf_counter()
 
         node_id = self.snap_to_node(lat, lng)
@@ -467,131 +627,172 @@ class GraphService:
         )
         self.incidents.append(incident)
 
-        self._mission_seq += 1
-        mission, reasons = fleet.assign(
-            incident,
-            self.graph,
-            self.vehicles,
-            self._node_coords,
-            self._mission_seq,
-        )
-        if mission is not None:
+        vehicle, route, backup_vehicle, backup_route, reasons = fleet.assign(self.graph, node_id, self.vehicles)
+        if vehicle is not None and route is not None:
+            self._mission_seq += 1
+            mission = Mission(
+                id=f"mission-{self._mission_seq}",
+                incident_id=incident.id,
+                vehicle_id=vehicle.id,
+                route=route,
+                backup_route=backup_route,
+                eta_s=route.eta_s,
+                status="active",
+                reasons=reasons,
+            )
             self.missions.append(mission)
-            assigned_vehicle = next(v for v in self.vehicles if v.id == mission.vehicle_id)
-            assigned_vehicle.status = "en_route"
-            assigned_vehicle.mission_id = mission.id
+            vehicle.status = "en_route"
+            vehicle.mission_id = mission.id
             incident.status = "assigned"
-            self._add_decision(
-                kind="assignment",
-                headline=(
-                    f"{assigned_vehicle.callsign} dispatched to {incident.id} "
-                    f"— ETA {mission.eta_s:.0f}s"
-                )[:90],
-                reasons=reasons,
-                data={"mission_id": mission.id, "vehicle_id": assigned_vehicle.id},
-            )
+            headline = f"{vehicle.callsign} dispatched to incident {incident.id} — ETA {route.eta_s:.0f}s"
+            if backup_vehicle is not None:
+                headline += f" (backup: {backup_vehicle.callsign})"
+            self._log_decision("assignment", headline, reasons=reasons)
         else:
-            self._add_decision(
-                kind="assignment",
-                headline=f"No unit available for {incident.id} — all routes blocked or no vehicles free",
-                reasons=reasons,
-                data={"incident_id": incident.id},
-            )
+            self._log_decision("assignment", f"Incident {incident.id} — no unit could be assigned", reasons=reasons)
 
         snapshot = self.build_snapshot(started_at=start)
         self.event_bus.emit("graph_changed", snapshot)
         return snapshot
+
+    def resolve_incident(self, incident_id: str) -> StateSnapshot:
+        """Mark the incident resolved, free its vehicle, and complete its
+        mission. Lets the operator clear a handled incident from the map
+        instead of it sitting there forever."""
+        start = time.perf_counter()
+        incident = self._incident_by_id(incident_id)
+        if incident is None:
+            raise IncidentNotFoundError(incident_id)
+
+        incident.status = "resolved"
+        for mission in self.missions:
+            if mission.incident_id != incident_id or mission.status == "complete":
+                continue
+            mission.status = "complete"
+            vehicle = self._vehicle_by_id(mission.vehicle_id)
+            if vehicle is not None:
+                vehicle.status = "available"
+                vehicle.mission_id = None
+
+        self._log_decision("assignment", f"Incident {incident_id} resolved")
+        snapshot = self.build_snapshot(started_at=start)
+        self.event_bus.emit("graph_changed", snapshot)
+        return snapshot
+
+    def apply_rainfall(self, rainfall_mm: float) -> StateSnapshot:
+        """Flood edges proportional to rainfall intensity and local elevation.
+        Low-lying roads (<10 m) flood first; at 200 mm almost everything
+        below 25 m is under water. Clears previous rainfall-driven depths
+        before re-applying so callers can drag a slider live."""
+        assert self.graph is not None
+        start = time.perf_counter()
+
+        # Clear any previously rainfall-driven flood depths.
+        for _u, _v, _k, data in self.graph.edges(keys=True, data=True):
+            if data.get("rainfall_flooded"):
+                data["flood_depth_cm"] = 0.0
+                data["status"] = _edge_status(0.0)
+                data["safety_score"] = min(100, max(20, int(50 + data.get("elevation_m", 10.0) * 2.5)))
+                data["rainfall_flooded"] = False
+                data["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        flooded_count = 0
+        if rainfall_mm > 10.0:
+            for _u, _v, _k, data in self.graph.edges(keys=True, data=True):
+                elev = data.get("elevation_m", 10.0)
+                # vulnerability: 0.0 at ≥25 m, 1.0 at river level (2 m)
+                vulnerability = max(0.0, (25.0 - elev) / 23.0)
+                depth = min(60.0, (rainfall_mm - 10.0) * vulnerability * 0.35)
+                if depth > 0.5:
+                    data["flood_depth_cm"] = depth
+                    data["status"] = _edge_status(depth)
+                    # Safety score degrades under water
+                    data["safety_score"] = max(5, min(100, int(50 + elev * 2.5) - int(depth * 1.2)))
+                    data["rainfall_flooded"] = True
+                    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    flooded_count += 1
+
+        self._edge_index = _index_edges(self.graph)
+        self._components_cache = impact.compute_components(self.graph)
+        fleet.reassess_all(self.graph, self.missions, self.vehicles, self.incidents)
+        self._log_decision(
+            "impact",
+            f"Rainfall {rainfall_mm:.0f} mm applied — {flooded_count} road segments flooded",
+            reasons=[f"Low-elevation roads (< 25 m) affected; {flooded_count} edges now risky or blocked"],
+        )
+        snapshot = self.build_snapshot(started_at=start)
+        self.event_bus.emit("graph_changed", snapshot)
+        return snapshot
+
+    def get_road_inspector(self, edge_id: str) -> dict[str, Any]:
+        """Return full details for one edge: attributes, nearby zones/POIs,
+        and a what-if preview of what closing it would cost."""
+        assert self.graph is not None
+        u, v, k = self._lookup_edge(edge_id)
+        data = self.graph[u][v][k]
+
+        u_node, v_node = self.graph.nodes[u], self.graph.nodes[v]
+        edge_center_lat = (float(u_node["y"]) + float(v_node["y"])) / 2
+        edge_center_lng = (float(u_node["x"]) + float(v_node["x"])) / 2
+
+        nearby_zones = []
+        for zone in self.zones:
+            dist_m = _haversine_m(edge_center_lat, edge_center_lng, zone.lat, zone.lng)
+            if dist_m < 2500:
+                nearby_zones.append({
+                    "id": zone.id, "name": zone.name,
+                    "population": zone.population, "distance_m": round(dist_m),
+                })
+        nearby_zones.sort(key=lambda z: z["distance_m"])
+
+        nearby_pois = []
+        for poi in self.pois:
+            dist_m = _haversine_m(edge_center_lat, edge_center_lng, poi.lat, poi.lng)
+            if dist_m < 2500:
+                nearby_pois.append({
+                    "id": poi.id, "name": poi.name, "kind": poi.kind,
+                    "distance_m": round(dist_m),
+                })
+        nearby_pois.sort(key=lambda p: p["distance_m"])
+
+        # What-if: hypothetically close this edge and see the impact.
+        try:
+            whatif = self.whatif(edge_id)
+            if_closed_zones = [z.name for z in whatif.isolated_zones]
+            if_closed_pop = whatif.affected_population
+            if_closed_recommendation = whatif.recommendation
+        except Exception:
+            if_closed_zones = []
+            if_closed_pop = 0
+            if_closed_recommendation = "Could not compute impact."
+
+        return {
+            "edge_id": edge_id,
+            "highway_class": data["highway_class"],
+            "length_m": round(data["length_m"], 1),
+            "flood_depth_cm": round(data["flood_depth_cm"], 1),
+            "status": data["status"],
+            "safety_score": data["safety_score"],
+            "elevation_m": round(data.get("elevation_m", 10.0), 1),
+            "critical": data["critical"],
+            "nearby_zones": nearby_zones[:5],
+            "nearby_pois": nearby_pois[:5],
+            "if_closed_zones": if_closed_zones,
+            "if_closed_population": if_closed_pop,
+            "if_closed_recommendation": if_closed_recommendation,
+        }
+
+    def compute_user_route(self, origin_lat: float, origin_lng: float,
+                           dest_lat: float, dest_lng: float) -> dict[str, Any]:
+        """Plan a safe route between two user-specified points."""
+        assert self.graph is not None
+        origin_node = self.snap_to_node(origin_lat, origin_lng)
+        dest_node = self.snap_to_node(dest_lat, dest_lng)
+        route = compute_route(self.graph, origin_node, dest_node)
+        return route.model_dump(mode="json")
 
     def _vehicle_by_id(self, vehicle_id: str) -> Vehicle | None:
         return next((v for v in self.vehicles if v.id == vehicle_id), None)
 
     def _incident_by_id(self, incident_id: str) -> Incident | None:
         return next((i for i in self.incidents if i.id == incident_id), None)
-
-    def _reassess_missions(self) -> None:
-        """Prompt-8 fleet reassessment: recompute routes, reassign when
-        current route is unreachable or a better unit now beats ETA >25%,
-        and log every material decision."""
-        reassess_decisions = fleet.reassess_all(
-            self.graph,
-            self.vehicles,
-            self.missions,
-            self.incidents,
-            self._node_coords,
-        )
-        for rd in reassess_decisions:
-            if rd.action == "reassigned":
-                headline = (
-                    f"{rd.new_vehicle_callsign} reassigned to mission {rd.mission_id} "
-                    f"(replacing {rd.old_vehicle_callsign})"
-                )[:90]
-            elif rd.action == "rerouted":
-                headline = f"Mission {rd.mission_id} rerouted ({rd.old_vehicle_callsign})"
-            else:
-                headline = f"Mission {rd.mission_id} unreachable — no route available"
-            kind = "reroute" if rd.action in ("rerouted", "unreachable") else "assignment"
-            self._add_decision(
-                kind=kind,
-                headline=headline[:90],
-                reasons=rd.reasons,
-                data={"mission_id": rd.mission_id},
-            )
-
-    def resolve_incident(self, incident_id: str) -> StateSnapshot:
-        """Resolve an incident, free its vehicle, mark mission complete, and broadcast."""
-        start = time.perf_counter()
-        incident = self._incident_by_id(incident_id)
-        if not incident:
-            return self.build_snapshot(started_at=start)
-
-        incident.status = "resolved"
-        # Find the active/rerouted mission for this incident
-        mission = next(
-            (m for m in self.missions if m.incident_id == incident_id and m.status in ("active", "rerouted", "reassigned")),
-            None
-        )
-        if mission:
-            mission.status = "complete"
-            vehicle = self._vehicle_by_id(mission.vehicle_id)
-            if vehicle:
-                vehicle.status = "available"
-                vehicle.mission_id = None
-            self._add_decision(
-                kind="assignment",
-                headline=f"Incident {incident_id} resolved — mission complete",
-                reasons=[f"Incident {incident_id} marked as resolved.", f"Vehicle {vehicle.callsign if vehicle else 'unknown'} returned to available status."],
-                data={"incident_id": incident_id, "mission_id": mission.id},
-            )
-        else:
-            self._add_decision(
-                kind="assignment",
-                headline=f"Incident {incident_id} resolved",
-                reasons=[f"Incident {incident_id} marked as resolved."],
-                data={"incident_id": incident_id},
-            )
-
-        snapshot = self.build_snapshot(started_at=start)
-        self.event_bus.emit("graph_changed", snapshot)
-        return snapshot
-
-    async def reset_state(self) -> None:
-        """Reset the system back to the pristine state by reloading GraphML and annotations."""
-        self.graph = load_graph(GRAPH_PATH)
-        self.zones, self.pois = load_annotations(self.graph, DEMO_AREA_PATH)
-        self._edge_index = _index_edges(self.graph)
-        self.vehicles = fleet.seed_vehicles(self.zones, self._node_coords)
-        self.incidents = []
-        self.missions = []
-        self.decisions = []
-        self.latest_impact = None
-        self._components_cache = impact.compute_components(self.graph)
-        self._seq = 0
-        self._incident_seq = 0
-        self._mission_seq = 0
-        self._decision_seq = 0
-        self._add_decision(
-            kind="assignment",
-            headline="System state reset to pristine configuration",
-            reasons=["All flooded segments cleared.", "All active incidents and missions terminated."],
-        )
-

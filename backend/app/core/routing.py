@@ -20,6 +20,8 @@ from app.models import LineStringGeometry, RouteResult
 IMPASSABLE_CM = 30.0
 RISK_ALPHA = 2.0
 CRITICAL_BETA = 1.3
+# Confidence penalty: lower confidence increases cost to reflect uncertainty
+CONFIDENCE_GAMMA = 0.5
 
 # Upper bound on any edge's real speed in the demo graph (observed max is
 # 60 kph); comfortably above that keeps the A* heuristic admissible (never
@@ -31,13 +33,19 @@ EARTH_RADIUS_M = 6371000.0
 
 
 def edge_cost(attrs: dict[str, Any]) -> float:
-    """Composite routing cost: time x flood multiplier x critical penalty."""
+    """Composite routing cost: time x flood multiplier x critical penalty x confidence penalty."""
     depth_cm = attrs.get("flood_depth_cm", 0.0)
     if depth_cm >= IMPASSABLE_CM:
         return math.inf
     multiplier = 1 + (depth_cm / IMPASSABLE_CM) * RISK_ALPHA
     if attrs.get("critical") and depth_cm > 0:
         multiplier *= CRITICAL_BETA
+    # Confidence penalty: lower confidence (uncertain reports) increases cost
+    # Confidence 100% = no penalty, 50% = 1.25x cost, 0% = 1.5x cost
+    confidence = attrs.get("confidence", 100)
+    if confidence < 100 and depth_cm > 0:
+        confidence_penalty = 1 + (1 - confidence / 100) * CONFIDENCE_GAMMA
+        multiplier *= confidence_penalty
     return attrs["base_time_s"] * multiplier
 
 

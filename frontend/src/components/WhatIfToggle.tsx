@@ -8,20 +8,28 @@ export function WhatIfToggle() {
   const setWhatIfMode = useAppStore((s) => s.setWhatIfMode);
 
   return (
-    <div className="pointer-events-none absolute bottom-6 left-1/2 z-10 -translate-x-1/2">
-      <motion.button
-        type="button"
-        onClick={() => setWhatIfMode(!whatIfMode)}
-        whileTap={{ scale: 0.96 }}
-        className={`pointer-events-auto flex items-center gap-2 rounded-full border px-4 py-2 font-mono text-xs uppercase tracking-wide backdrop-blur transition-colors ${
-          whatIfMode
-            ? "border-eoc-route bg-eoc-route/20 text-eoc-route"
-            : "border-white/10 bg-eoc-panel text-eoc-text/70 hover:text-eoc-text"
-        }`}
-      >
-        <span className={`h-1.5 w-1.5 rounded-full ${whatIfMode ? "bg-eoc-route" : "bg-eoc-text/30"}`} />
-        What-If Mode {whatIfMode ? "On" : "Off"}
-      </motion.button>
-    </div>
+    <motion.button
+      type="button"
+      onClick={() => setWhatIfMode(!whatIfMode)}
+      whileTap={{ scale: 0.96 }}
+      whileHover={{ scale: 1.02 }}
+      className={`pointer-events-auto flex items-center gap-3 rounded-xl border-2 px-4 py-2.5 font-mono text-xs font-bold uppercase tracking-wide backdrop-blur-xl transition-all ${
+        whatIfMode
+          ? "border-eoc-route/60 bg-eoc-route/20 text-eoc-route shadow-lg shadow-eoc-route/20"
+          : "border-white/10 bg-[#0d1117]/95 text-eoc-text/70 hover:border-white/20 hover:bg-white/5 hover:text-eoc-text"
+      }`}
+    >
+      <div className={`flex h-5 w-5 items-center justify-center rounded-lg ${
+        whatIfMode ? "bg-eoc-route" : "bg-white/10"
+      }`}>
+        <span className="text-sm">{whatIfMode ? "🔮" : "🎯"}</span>
+      </div>
+      <div className="flex flex-col items-start">
+        <span className="text-[10px]">What-If Mode</span>
+        <span className={`text-[9px] font-semibold ${whatIfMode ? "text-eoc-route" : "text-eoc-text/50"}`}>
+          {whatIfMode ? "SIMULATION ACTIVE" : "Click to simulate"}
+        </span>
+      </div>
+    </motion.button>
   );
 }

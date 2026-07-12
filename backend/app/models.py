@@ -16,12 +16,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 EdgeStatus = Literal["safe", "risky", "blocked"]
-POIKind = Literal["hospital", "shelter"]
+POIKind = Literal["hospital", "shelter", "fire_station", "police", "utility"]
 VehicleKind = Literal["ambulance", "rescue_truck"]
 VehicleStatus = Literal["available", "en_route"]
 IncidentStatus = Literal["open", "assigned", "resolved"]
 MissionStatus = Literal["active", "rerouted", "reassigned", "complete"]
-DecisionKind = Literal["assignment", "reroute", "impact", "whatif"]
+DecisionKind = Literal["assignment", "reroute", "impact", "whatif", "safezone"]
 
 
 class EdgeAttributes(BaseModel):
@@ -39,6 +39,12 @@ class EdgeAttributes(BaseModel):
     safety_score: int = 100
     critical: bool = False
     updated_at: datetime
+    # Confidence in flood report (0-100%): 100% = confirmed by sensors, 
+    # 50% = citizen report, 0% = no data. Used for uncertainty-aware routing.
+    confidence: int = 100
+    # at_risk: True if this edge is predicted to flood soon based on
+    # proximity to currently flooded edges (contagion model heuristic).
+    at_risk: bool = False
 
 
 class LineStringGeometry(BaseModel):

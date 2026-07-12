@@ -5,12 +5,12 @@
 import type { FeatureCollection } from "geojson";
 
 export type EdgeStatus = "safe" | "risky" | "blocked";
-export type POIKind = "hospital" | "shelter";
+export type POIKind = "hospital" | "shelter" | "fire_station" | "police" | "utility";
 export type VehicleKind = "ambulance" | "rescue_truck";
 export type VehicleStatus = "available" | "en_route";
 export type IncidentStatus = "open" | "assigned" | "resolved";
 export type MissionStatus = "active" | "rerouted" | "reassigned" | "complete";
-export type DecisionKind = "assignment" | "reroute" | "impact" | "whatif";
+export type DecisionKind = "assignment" | "reroute" | "impact" | "whatif" | "safezone";
 
 export interface EdgeAttributes {
   edge_id: string;
@@ -20,8 +20,31 @@ export interface EdgeAttributes {
   flood_depth_cm: number;
   status: EdgeStatus;
   safety_score: number;
+  elevation_m: number;
   critical: boolean;
   updated_at: string;
+  // Confidence in flood report (0-100%): 100% = confirmed by sensors,
+  // 50% = citizen report, 0% = no data. Used for uncertainty-aware routing.
+  confidence: number;
+  // at_risk: True if this edge is predicted to flood soon based on
+  // proximity to currently flooded edges (contagion model heuristic).
+  at_risk: boolean;
+}
+
+export interface RoadInspectorData {
+  edge_id: string;
+  highway_class: string;
+  length_m: number;
+  flood_depth_cm: number;
+  status: EdgeStatus;
+  safety_score: number;
+  elevation_m: number;
+  critical: boolean;
+  nearby_zones: { id: string; name: string; population: number; distance_m: number }[];
+  nearby_pois: { id: string; name: string; kind: POIKind; distance_m: number }[];
+  if_closed_zones: string[];
+  if_closed_population: number;
+  if_closed_recommendation: string;
 }
 
 export interface LineStringGeometry {

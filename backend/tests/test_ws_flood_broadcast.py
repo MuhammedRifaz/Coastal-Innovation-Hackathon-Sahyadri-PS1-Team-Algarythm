@@ -78,5 +78,11 @@ def test_both_ws_clients_receive_snapshot_after_flood_post(live_server):
 
     assert msg1["seq"] == posted_seq
     assert msg2["seq"] == posted_seq
-    assert msg1["computed_in_ms"] < 200
-    assert msg2["computed_in_ms"] < 200
+    # Master-plan hard bound is <1000ms (target <300ms as an aspiration).
+    # Flooding the bridge now also runs full impact analysis (component
+    # recomputation) and the recommendation's fleet.assign() (a true
+    # route-cost search across every available vehicle), which costs more
+    # than the original single-route Prompt 4 baseline this threshold was
+    # first set against.
+    assert msg1["computed_in_ms"] < 1000
+    assert msg2["computed_in_ms"] < 1000

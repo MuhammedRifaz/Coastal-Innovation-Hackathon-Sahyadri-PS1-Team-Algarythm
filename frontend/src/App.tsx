@@ -1,23 +1,15 @@
-// ResQOS App layout:
-//  ┌─────────────────────────────────────────┐
-//  │ Header (48px, full width, z-20)         │
-//  ├────────────────────────────┬────────────┤
-//  │                            │  Sidebar   │
-//  │   MapView (full-bleed)     │  (320px)   │
-//  │                            │            │
-//  └────────────────────────────┴────────────┘
-//
-// MapView fills the entire viewport (behind everything).
-// Header sits on top at z-20.
-// Sidebar sits on top at z-10, right-aligned, below the header.
-// No more overlapping absolute panels.
-
-import { useEffect } from "react";
+﻿import { useEffect } from "react";
 import { MapView } from "./map/MapView";
 import { Header } from "./components/Header";
-import { Sidebar } from "./components/Sidebar";
-import { DecisionLog } from "./components/DecisionLog";
+import { LatencyBadge } from "./components/LatencyBadge";
+import { ImpactAlert } from "./components/ImpactAlert";
+import { MissionPanel } from "./components/MissionPanel";
+import { WhatIfToggle } from "./components/WhatIfToggle";
 import { ScenarioBar } from "./components/ScenarioBar";
+import { DecisionLog } from "./components/DecisionLog";
+import { RoadInspector } from "./components/RoadInspector";
+import { RoutePlanner } from "./components/RoutePlanner";
+import { FleetAdvisor } from "./components/FleetAdvisor";
 import { getGraph } from "./lib/api";
 import { connectWebSocket } from "./lib/ws";
 import { useAppStore } from "./store/useAppStore";
@@ -27,28 +19,44 @@ function App() {
     getGraph()
       .then((data) => useAppStore.getState().setFromGraphResponse(data))
       .catch((err) => console.error("initial /api/graph fetch failed", err));
+
     connectWebSocket();
   }, []);
 
   return (
-    <div className="relative h-dvh w-dvw overflow-hidden bg-eoc-bg text-eoc-text">
-      {/* Full-bleed map — renders under everything */}
-      <MapView />
-
-      {/* Header bar — top, full width, above map */}
+    <div className="relative flex h-dvh w-dvw flex-col overflow-hidden bg-eoc-bg text-eoc-text">
       <Header />
 
-      {/* Right sidebar — below header, right edge */}
-      <Sidebar />
+      <div className="relative flex-1">
+        <MapView />
 
-      {/* Bottom decision ticker */}
-      <DecisionLog />
+        {/* Right-side stack: latency badge, road inspector, impact alert, mission panel */}
+        <div className="pointer-events-none absolute top-4 right-4 z-10 flex flex-col items-end gap-3">
+          <LatencyBadge />
+          <RoadInspector />
+          <FleetAdvisor />
+          <ImpactAlert />
+          <MissionPanel />
+        </div>
 
-      {/* Bottom center scenario control bar */}
-      <ScenarioBar />
+        {/* Bottom-center: scenario controls + what-if toggle + route planner */}
+        <div className="pointer-events-none absolute bottom-6 left-1/2 z-10 flex -translate-x-1/2 flex-col items-center gap-2">
+          <div className="flex items-center gap-3">
+            <WhatIfToggle />
+            <RoutePlanner />
+          </div>
+          <ScenarioBar />
+        </div>
+
+        {/* Bottom-left: decision log ticker */}
+        <div className="pointer-events-none absolute bottom-6 left-4 z-10 hidden xl:block">
+          <DecisionLog />
+        </div>
+      </div>
     </div>
   );
 }
 
 export default App;
+
 

@@ -56,7 +56,10 @@ def test_no_impact_analysis_for_non_blocking_flood(service: GraphService):
     edge_id = CRITICAL_BRIDGE_EDGE_IDS[0]
     snapshot = service.apply_flood(edge_id, 15.0)  # risky, not blocked
 
-    assert snapshot.latest_impact is None
+    # Now we run impact analysis for any flood to provide warnings
+    assert snapshot.latest_impact is not None
+    # But it should not isolate zones since road is still passable
+    assert len(snapshot.latest_impact.isolated_zones) == 0
 
 
 def test_clearing_a_flood_clears_the_alert(service: GraphService):

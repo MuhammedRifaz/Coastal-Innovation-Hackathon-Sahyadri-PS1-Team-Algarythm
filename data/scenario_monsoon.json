@@ -1,43 +1,40 @@
 {
-  "name": "monsoon_surge",
-  "title": "Monsoon Surge — NH66 River Crossing Scenario",
-  "description": "Simulates a rapid monsoon event: initial flooding on urban roads, a south-side incident, then the NH66 bridge is overwhelmed — cutting off two zones and forcing a reassignment.",
+  "_comment": "Monsoon Surge storyline (~20s). Rainfall waves flood hundreds of low-elevation roads for visual drama; the t=8 bridge flood severs the NH66 crossing (edge-group logic floods all 3 carriageway segments), triggering the impact alert + safe-zone remap; the t=11 southern incident forces a hard fleet-assignment decision while the bridge is out; t=18 the rain eases and low roads visibly recover.",
   "steps": [
     {
       "t_s": 0,
-      "action": "incident",
-      "params": { "lat": 12.863, "lng": 74.841, "severity": 2 },
-      "narrate": "Flooding reported near city centre — Unit 1 dispatched"
+      "action": "rainfall",
+      "params": { "rainfall_mm": 40 }
     },
     {
-      "t_s": 3,
+      "t_s": 2,
+      "action": "incident",
+      "params": { "lat": 12.852, "lng": 74.841, "severity": 2 }
+    },
+    {
+      "t_s": 5,
+      "action": "rainfall",
+      "params": { "rainfall_mm": 80 }
+    },
+    {
+      "t_s": 8,
       "action": "flood",
-      "params": { "edge_id": "auto:urban-north-1", "depth_cm": 20 },
-      "narrate": "Urban road south of Bunder showing 20 cm water"
+      "params": { "edge_id": "3610166954_11266540718_0", "depth_cm": 45.0 }
     },
     {
-      "t_s": 6,
+      "t_s": 11,
       "action": "incident",
-      "params": { "lat": 12.815, "lng": 74.850, "severity": 3 },
-      "narrate": "High-severity incident in Ullal — south of the river"
+      "params": { "lat": 12.815, "lng": 74.850, "severity": 3 }
     },
     {
-      "t_s": 10,
-      "action": "flood_bridge",
-      "params": { "depth_cm": 55 },
-      "narrate": "NH66 bridge overwhelmed — 55 cm depth, bridge severed"
+      "t_s": 14,
+      "action": "rainfall",
+      "params": { "rainfall_mm": 110 }
     },
     {
-      "t_s": 15,
-      "action": "incident",
-      "params": { "lat": 12.820, "lng": 74.843, "severity": 2 },
-      "narrate": "Additional incident south of the river"
-    },
-    {
-      "t_s": 20,
-      "action": "flood",
-      "params": { "edge_id": "auto:urban-north-2", "depth_cm": 35 },
-      "narrate": "Second northern road blocked — 35 cm"
+      "t_s": 18,
+      "action": "rainfall",
+      "params": { "rainfall_mm": 55 }
     }
   ]
 }

@@ -7,20 +7,23 @@ import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import type { FeatureCollection } from "geojson";
 import { useAppStore } from "../store/useAppStore";
-import { postFlood, postFloodClear, postIncident, postWhatIf } from "../lib/api";
+import { getRoadInspector, postFlood, postFloodClear, postIncident, postUserRoute, postWhatIf } from "../lib/api";
 import { useRouteAnimation } from "./useRouteAnimation";
+import { useSafeZoneLayer } from "./SafeZoneLayer";
 
 const CARTO_DARK_STYLE = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
 
 const ROADS_SOURCE_ID = "roads";
 const BASE_LAYER_ID = "roads-base";
 const FLOOD_OVERLAY_LAYER_ID = "roads-flood-overlay";
+const UNCERTAIN_FLOOD_LAYER_ID = "roads-uncertain-flood";
+const AT_RISK_LAYER_ID = "roads-at-risk";
 
 const MISSIONS_SOURCE_ID = "mission-routes";
 const MISSIONS_LAYER_ID = "mission-routes-line";
 
-const BACKUP_ROUTES_SOURCE_ID = "backup-routes";
-const BACKUP_ROUTES_LAYER_ID = "backup-routes-line";
+const BACKUP_SOURCE_ID = "mission-backup-route";
+const BACKUP_LAYER_ID = "mission-backup-route-line";
 
 const INCIDENTS_SOURCE_ID = "incidents";
 const INCIDENTS_RING_LAYER_ID = "incidents-ring";
@@ -36,6 +39,15 @@ const ISOLATED_ZONES_SOURCE_ID = "isolated-zones";
 const ISOLATED_ZONES_FILL_LAYER_ID = "isolated-zones-fill";
 const ISOLATED_ZONES_OUTLINE_LAYER_ID = "isolated-zones-outline";
 const RED_HATCH_IMAGE = "red-hatch";
+
+const POIS_SOURCE_ID = "pois";
+const HOSPITALS_GLOW_LAYER_ID = "hospitals-glow";
+const HOSPITALS_DOT_LAYER_ID = "hospitals-dot";
+
+const USER_ROUTE_SOURCE_ID = "user-route";
+const USER_ROUTE_LAYER_ID = "user-route-line";
+const ROUTE_PINS_SOURCE_ID = "route-pins";
+const ROUTE_PINS_LAYER_ID = "route-pins-dot";
 
 // Default severity for click-to-report incidents until a severity picker
 // UI exists (later polish prompt).
@@ -81,6 +93,18 @@ const IS_FLOODED_FILTER: maplibregl.ExpressionSpecification = [
   ["==", ["get", "status"], "blocked"],
 ];
 
+const IS_UNCERTAIN_FLOOD_FILTER: maplibregl.ExpressionSpecification = [
+  "all",
+  [">", ["get", "flood_depth_cm"], 0],
+  ["<", ["get", "confidence"], 100],
+];
+
+const IS_AT_RISK_FILTER: maplibregl.ExpressionSpecification = [
+  "all",
+  ["==", ["get", "at_risk"], true],
+  ["==", ["get", "flood_depth_cm"], 0],
+];
+
 // Pulsing red ring period, in ms, for incident markers.
 const PULSE_PERIOD_MS = 1400;
 
@@ -93,6 +117,22 @@ function buildIncidentsFeatureCollection(): FeatureCollection {
       properties: { id: incident.id, severity: incident.severity, status: incident.status },
       geometry: { type: "Point", coordinates: [incident.lng, incident.lat] },
     })),
+  };
+}
+
+function buildBackupRouteFeatureCollection(): FeatureCollection {
+  const { missions, expandedMissionId } = useAppStore.getState();
+  const mission = missions.find((m) => m.id === expandedMissionId);
+  if (!mission?.backup_route) return EMPTY_FEATURE_COLLECTION;
+  return {
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        properties: { mission_id: mission.id },
+        geometry: { type: "LineString", coordinates: mission.backup_route.geometry.coordinates },
+      },
+    ],
   };
 }
 
@@ -186,6 +226,9 @@ export function MapView() {
   const mapRef = useRef<maplibregl.Map | null>(null);
   const missions = useAppStore((s) => s.missions);
 
+  // Initialize safe zone layer
+  useSafeZoneLayer(mapRef);
+
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -207,9 +250,46 @@ export function MapView() {
     let animationFrameId = 0;
 
     const handleClick = (e: maplibregl.MapMouseEvent) => {
-      // Ignore clicks inside the 320px right sidebar column (those are for UI buttons).
-      const sidebarWidth = 320;
-      if (e.point.x > map.getCanvas().width - sidebarWidth) return;
+      const { whatIfMode, setHypotheticalImpact, setRoadInspector,
+              routePlannerMode, setRoutePlannerMode, setRoutePlannerOrigin,
+              setRoutePlannerDest, setRoutePlannerResult } = useAppStore.getState();
+
+      // Route planner: capture origin then destination clicks.
+      if (routePlannerMode === "picking_origin") {
+        setRoutePlannerOrigin([e.lngLat.lat, e.lngLat.lng]);
+        setRoutePlannerMode("picking_dest");
+        return;
+      }
+      if (routePlannerMode === "picking_dest") {
+        const { routePlannerOrigin: origin } = useAppStore.getState();
+        if (!origin) return;
+        setRoutePlannerDest([e.lngLat.lat, e.lngLat.lng]);
+        setRoutePlannerMode("showing");
+        postUserRoute(origin[0], origin[1], e.lngLat.lat, e.lngLat.lng)
+          .then((route) => {
+            setRoutePlannerResult(route);
+            const source = map.getSource(USER_ROUTE_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+            const pins = map.getSource(ROUTE_PINS_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+            if (route.reachable && route.geometry.coordinates.length > 0) {
+              // Color route based on risk level
+              const routeColor = route.risk_score <= 20 ? "#22C55E" : route.risk_score <= 50 ? "#F59E0B" : "#EF4444";
+              if (map.getLayer(USER_ROUTE_LAYER_ID)) {
+                map.setPaintProperty(USER_ROUTE_LAYER_ID, "line-color", routeColor);
+                map.setPaintProperty("user-route-glow", "line-color", routeColor);
+              }
+              source?.setData({ type: "FeatureCollection", features: [
+                { type: "Feature", properties: { risk_score: route.risk_score }, geometry: { type: "LineString", coordinates: route.geometry.coordinates } },
+              ]});
+            }
+            const dest = useAppStore.getState().routePlannerDest;
+            pins?.setData({ type: "FeatureCollection", features: [
+              { type: "Feature", properties: { kind: "origin" }, geometry: { type: "Point", coordinates: [origin[1], origin[0]] } },
+              ...(dest ? [{ type: "Feature" as const, properties: { kind: "dest" }, geometry: { type: "Point" as const, coordinates: [dest[1], dest[0]] } }] : []),
+            ]});
+          })
+          .catch((err) => console.error("user route failed", err));
+        return;
+      }
 
       // A small bounding box, not a single point, so a thin road line is
       // easy to hit — MapLibre's point query has almost no tolerance.
@@ -219,7 +299,6 @@ export function MapView() {
       ];
       const roadFeatures = map.queryRenderedFeatures(box, { layers: [BASE_LAYER_ID] });
       const edgeId = roadFeatures[0]?.properties?.edge_id as string | undefined;
-      const { whatIfMode, setHypotheticalImpact } = useAppStore.getState();
 
       if (edgeId) {
         if (whatIfMode) {
@@ -228,6 +307,10 @@ export function MapView() {
             .catch((err) => console.error("what-if failed", err));
           return;
         }
+        // Show road inspector + toggle flood on second click.
+        getRoadInspector(edgeId)
+          .then((data) => setRoadInspector(data))
+          .catch((err) => console.error("road inspector failed", err));
         const status = roadFeatures[0]?.properties?.status as string | undefined;
         const action =
           status === "blocked" || status === "risky"
@@ -236,6 +319,9 @@ export function MapView() {
         action.catch((err) => console.error("failed to toggle flood", err));
         return;
       }
+
+      // Close road inspector when clicking empty map.
+      setRoadInspector(null);
 
       // No road under the click: report an incident there instead. Skip
       // this while What-If is on — that mode only probes road closures.
@@ -290,6 +376,34 @@ export function MapView() {
         },
       });
 
+      // Uncertain flood reports - dashed orange lines for low-confidence reports
+      map.addLayer({
+        id: UNCERTAIN_FLOOD_LAYER_ID,
+        type: "line",
+        source: ROADS_SOURCE_ID,
+        filter: IS_UNCERTAIN_FLOOD_FILTER,
+        paint: {
+          "line-color": "#F97316",
+          "line-opacity": 0.6,
+          "line-width": ["case", ["get", "critical"], 3.5, 2],
+          "line-dasharray": [4, 4],
+        },
+      });
+
+      // At-risk edges - yellow dotted lines for predicted flood spread
+      map.addLayer({
+        id: AT_RISK_LAYER_ID,
+        type: "line",
+        source: ROADS_SOURCE_ID,
+        filter: IS_AT_RISK_FILTER,
+        paint: {
+          "line-color": "#FBBF24",
+          "line-opacity": 0.5,
+          "line-width": 2,
+          "line-dasharray": [2, 4],
+        },
+      });
+
       map.addImage(RED_HATCH_IMAGE, makeHatchPatternImage("#F87171"));
       map.addSource(ISOLATED_ZONES_SOURCE_ID, {
         type: "geojson",
@@ -321,18 +435,17 @@ export function MapView() {
         },
       });
 
-      // Backup route: dashed, 50% opacity — visible only when a card is expanded
-      map.addSource(BACKUP_ROUTES_SOURCE_ID, { type: "geojson", data: EMPTY_FEATURE_COLLECTION });
+      map.addSource(BACKUP_SOURCE_ID, { type: "geojson", data: EMPTY_FEATURE_COLLECTION });
       map.addLayer({
-        id: BACKUP_ROUTES_LAYER_ID,
+        id: BACKUP_LAYER_ID,
         type: "line",
-        source: BACKUP_ROUTES_SOURCE_ID,
+        source: BACKUP_SOURCE_ID,
         layout: { "line-cap": "round", "line-join": "round" },
         paint: {
           "line-color": "#38BDF8",
           "line-width": 2.5,
           "line-opacity": 0.5,
-          "line-dasharray": [4, 3],
+          "line-dasharray": [2, 2],
         },
       });
 
@@ -357,6 +470,126 @@ export function MapView() {
           "circle-color": "#F87171",
           "circle-stroke-color": "#0B0F14",
           "circle-stroke-width": 1.5,
+        },
+      });
+
+      // POI layer: hospital glows + shelter markers.
+      const poisFC: FeatureCollection = {
+        type: "FeatureCollection",
+        features: useAppStore.getState().pois.map((poi) => ({
+          type: "Feature",
+          properties: { id: poi.id, kind: poi.kind, name: poi.name, stroke_ready: poi.stroke_ready },
+          geometry: { type: "Point", coordinates: [poi.lng, poi.lat] },
+        })),
+      };
+      map.addSource(POIS_SOURCE_ID, { type: "geojson", data: poisFC });
+      // Outer glow ring around hospitals — pulsed larger for stroke-ready ones.
+      map.addLayer({
+        id: HOSPITALS_GLOW_LAYER_ID,
+        type: "circle",
+        source: POIS_SOURCE_ID,
+        filter: ["==", ["get", "kind"], "hospital"],
+        paint: {
+          "circle-radius": ["case", ["get", "stroke_ready"], 28, 22],
+          "circle-color": "#F472B6",
+          "circle-opacity": 0.25,
+          "circle-stroke-width": 2,
+          "circle-stroke-color": "#F472B6",
+          "circle-stroke-opacity": 0.6,
+        },
+      });
+      // Inner glow ring for hospitals
+      map.addLayer({
+        id: "hospitals-inner-glow",
+        type: "circle",
+        source: POIS_SOURCE_ID,
+        filter: ["==", ["get", "kind"], "hospital"],
+        paint: {
+          "circle-radius": ["case", ["get", "stroke_ready"], 20, 16],
+          "circle-color": "#F472B6",
+          "circle-opacity": 0.35,
+          "circle-stroke-width": 1.5,
+          "circle-stroke-color": "#F472B6",
+          "circle-stroke-opacity": 0.7,
+        },
+      });
+      // Main dot for POIs
+      map.addLayer({
+        id: HOSPITALS_DOT_LAYER_ID,
+        type: "circle",
+        source: POIS_SOURCE_ID,
+        paint: {
+          "circle-radius": ["case", ["==", ["get", "kind"], "hospital"], 8, 5],
+          "circle-color": ["case", ["==", ["get", "kind"], "hospital"], "#F472B6", "#818CF8"],
+          "circle-stroke-color": "#0B0F14",
+          "circle-stroke-width": 2.5,
+        },
+      });
+      // Stroke-ready indicator ring for hospitals
+      map.addLayer({
+        id: "hospitals-stroke-ready",
+        type: "circle",
+        source: POIS_SOURCE_ID,
+        filter: ["all", ["==", ["get", "kind"], "hospital"], ["==", ["get", "stroke_ready"], true]],
+        paint: {
+          "circle-radius": 10,
+          "circle-color": "#22C55E",
+          "circle-opacity": 0.8,
+          "circle-stroke-width": 2,
+          "circle-stroke-color": "#0B0F14",
+        },
+      });
+
+      // User route planner layers.
+      map.addSource(USER_ROUTE_SOURCE_ID, { type: "geojson", data: EMPTY_FEATURE_COLLECTION });
+      // Route glow effect
+      map.addLayer({
+        id: "user-route-glow",
+        type: "line",
+        source: USER_ROUTE_SOURCE_ID,
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: { "line-color": "#A78BFA", "line-width": 8, "line-opacity": 0.3 },
+      });
+      // Main route line
+      map.addLayer({
+        id: USER_ROUTE_LAYER_ID,
+        type: "line",
+        source: USER_ROUTE_SOURCE_ID,
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: { "line-color": "#A78BFA", "line-width": 4, "line-opacity": 0.95 },
+      });
+      map.addSource(ROUTE_PINS_SOURCE_ID, { type: "geojson", data: EMPTY_FEATURE_COLLECTION });
+      // Route pin glow
+      map.addLayer({
+        id: "route-pins-glow",
+        type: "circle",
+        source: ROUTE_PINS_SOURCE_ID,
+        paint: {
+          "circle-radius": 12,
+          "circle-color": ["case", ["==", ["get", "kind"], "origin"], "#A78BFA", "#34D399"],
+          "circle-opacity": 0.4,
+        },
+      });
+      // Route pin main dot
+      map.addLayer({
+        id: ROUTE_PINS_LAYER_ID,
+        type: "circle",
+        source: ROUTE_PINS_SOURCE_ID,
+        paint: {
+          "circle-radius": 8,
+          "circle-color": ["case", ["==", ["get", "kind"], "origin"], "#A78BFA", "#34D399"],
+          "circle-stroke-color": "#0B0F14",
+          "circle-stroke-width": 2.5,
+        },
+      });
+      // Route pin inner dot
+      map.addLayer({
+        id: "route-pins-inner",
+        type: "circle",
+        source: ROUTE_PINS_SOURCE_ID,
+        paint: {
+          "circle-radius": 4,
+          "circle-color": "#0B0F14",
         },
       });
 
@@ -435,68 +668,51 @@ export function MapView() {
         const source = map.getSource(ISOLATED_ZONES_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
         source?.setData(buildIsolatedZonesFeatureCollection());
       }
-    });
-  }, []);
 
-  // Hover: dim non-hovered mission routes to 30%
-  useEffect(() => {
-    const unsubscribe = useAppStore.subscribe((state, prevState) => {
-      const map = mapRef.current;
-      if (!map || !map.getLayer(MISSIONS_LAYER_ID)) return;
-      if (state.hoveredMissionId === prevState.hoveredMissionId) return;
-
-      if (state.hoveredMissionId === null) {
-        // Nothing hovered — restore all to 95%
-        map.setPaintProperty(MISSIONS_LAYER_ID, "line-opacity", 0.95);
-      } else {
-        // Hovered mission: full opacity for hovered, 30% for others
-        // We store mission-id in GeoJSON properties.mission_id
-        map.setPaintProperty(MISSIONS_LAYER_ID, "line-opacity", [
-          "case",
-          ["==", ["get", "mission_id"], state.hoveredMissionId],
-          0.95,
-          0.3,
-        ]);
-      }
-    });
-    return unsubscribe;
-  }, []);
-
-  // Expand: show backup route as dashed line when card is expanded
-  useEffect(() => {
-    const unsubscribe = useAppStore.subscribe((state, prevState) => {
-      const map = mapRef.current;
-      if (!map || !map.getSource(BACKUP_ROUTES_SOURCE_ID)) return;
-      if (state.expandedMissionId === prevState.expandedMissionId &&
-          state.missions === prevState.missions) return;
-
-      const source = map.getSource(BACKUP_ROUTES_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
-      if (!source) return;
-
-      if (!state.expandedMissionId) {
-        source.setData(EMPTY_FEATURE_COLLECTION);
-        return;
+      if (state.hoveredMissionId !== prevState.hoveredMissionId) {
+        if (map.getLayer(MISSIONS_LAYER_ID)) {
+          const opacity = state.hoveredMissionId
+            ? (["case", ["==", ["get", "mission_id"], state.hoveredMissionId], 1, 0.3] as maplibregl.ExpressionSpecification)
+            : 0.95;
+          map.setPaintProperty(MISSIONS_LAYER_ID, "line-opacity", opacity);
+        }
       }
 
-      const mission = state.missions.find((m) => m.id === state.expandedMissionId);
-      if (!mission?.backup_route?.reachable || !mission.backup_route.geometry.coordinates.length) {
-        source.setData(EMPTY_FEATURE_COLLECTION);
-        return;
+      if (state.expandedMissionId !== prevState.expandedMissionId || state.missions !== prevState.missions) {
+        const source = map.getSource(BACKUP_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+        source?.setData(buildBackupRouteFeatureCollection());
       }
 
-      source.setData({
-        type: "FeatureCollection",
-        features: [{
-          type: "Feature",
-          properties: { mission_id: mission.id },
-          geometry: {
-            type: "LineString",
-            coordinates: mission.backup_route.geometry.coordinates,
-          },
-        }],
-      });
+      // Update user route when it's recalculated (e.g., after road flooding)
+      if (state.routePlannerResult !== prevState.routePlannerResult && state.routePlannerResult) {
+        const source = map.getSource(USER_ROUTE_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+        const route = state.routePlannerResult;
+        
+        if (route.reachable && route.geometry.coordinates.length > 0) {
+          // Color route based on risk level
+          const routeColor = route.risk_score <= 20 ? "#22C55E" : route.risk_score <= 50 ? "#F59E0B" : "#EF4444";
+          if (map.getLayer(USER_ROUTE_LAYER_ID)) {
+            map.setPaintProperty(USER_ROUTE_LAYER_ID, "line-color", routeColor);
+            map.setPaintProperty("user-route-glow", "line-color", routeColor);
+          }
+          source?.setData({ type: "FeatureCollection", features: [
+            { type: "Feature", properties: { risk_score: route.risk_score }, geometry: { type: "LineString", coordinates: route.geometry.coordinates } },
+          ]});
+        }
+      }
+
+      // Clear user route when planner resets.
+      if (state.routePlannerMode !== prevState.routePlannerMode && state.routePlannerMode === "idle") {
+        (map.getSource(USER_ROUTE_SOURCE_ID) as maplibregl.GeoJSONSource | undefined)?.setData(EMPTY_FEATURE_COLLECTION);
+        (map.getSource(ROUTE_PINS_SOURCE_ID) as maplibregl.GeoJSONSource | undefined)?.setData(EMPTY_FEATURE_COLLECTION);
+      }
+
+      // One-shot camera request (e.g. scenario start frames the bridge).
+      if (state.cameraTarget && state.cameraTarget !== prevState.cameraTarget) {
+        map.flyTo({ center: state.cameraTarget.center, zoom: state.cameraTarget.zoom, duration: 1800 });
+        useAppStore.getState().setCameraTarget(null);
+      }
     });
-    return unsubscribe;
   }, []);
 
   useRouteAnimation(missions, (fc) => {

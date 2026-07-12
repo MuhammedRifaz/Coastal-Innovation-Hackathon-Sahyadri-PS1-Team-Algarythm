@@ -10,3 +10,6 @@ frontend/dist/
 backend/cache/
 
 .claude/
+
+backend_err.txt
+backend_out.txt
