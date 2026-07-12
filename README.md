@@ -1,3 +1,5 @@
+
+
 # 🌊 ResQOS — Emergency Response Decision Engine
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -11,7 +13,11 @@
 > ResQOS is a next-generation **Emergency Response Decision Support Platform** designed for local Emergency Operations Centers (EOC) during extreme monsoon events. Unlike a consumer navigation app, it models the road network as a *dynamic, semantic graph* that updates in real-time, analyzes cascade infrastructure failures, optimizes emergency fleet routing by true operational cost, and explains its reasoning in plain language.
 
 <div align="center">
-  <video src="Video/Recording 2026-07-12 122056.mp4" width="100%" controls autoplay loop muted></video>
+  
+
+https://github.com/user-attachments/assets/26b45ae4-b969-4b87-98f0-70339c4653bf
+
+
   <p><em>ResQOS in Action: Real-time decision support, risk-aware routing, impact analysis, and fleet dispatch simulation.</em></p>
 </div>
 
